@@ -1,3 +1,7 @@
+# Backup files
+*~
+*.swp
+
 # Prerequisites
 *.d
 
@@ -35,6 +39,7 @@
 *.i*86
 *.x86_64
 *.hex
+/rasm
 
 # Debug files
 *.dSYM/
@@ -42,11 +47,3 @@
 *.idb
 *.pdb
 
-# Kernel Module Compile Results
-*.mod*
-*.cmd
-.tmp_versions/
-modules.order
-Module.symvers
-Mkfile.old
-dkms.conf
