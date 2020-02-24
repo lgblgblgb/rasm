@@ -26,4 +26,4 @@ jobs:
     - name: Show result
       run: ls -l rasm rasm.exe
     - name: Show assembler help screen
-      run: ./rasm -h
+      run: ./rasm -h || true
