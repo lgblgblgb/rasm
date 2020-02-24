@@ -24,4 +24,6 @@ jobs:
     - name: Compiling for Windows 64-bit
       run: sudo -u lgb make rasm.exe
     - name: Show result
-      run: ls -l rasm rasm.ext
+      run: ls -l rasm rasm.exe
+    - name: Show assembler help screen
+      run: ./rasm -h
