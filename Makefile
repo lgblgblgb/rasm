@@ -1,5 +1,5 @@
 CC	= gcc
-CFLAGS	= -Wall -Ofast -march=native
+CFLAGS	= -Wall -Ofast -fno-common -flto
 LDFLAGS	= -lm
 CCWIN64 = x86_64-w64-mingw32-gcc
 CCWIN32	= i686-w64-mingw32-gcc
@@ -11,7 +11,7 @@ rasm: rasm.c *.c *.h $(ALLDEPS)
 	$(CC) $< $(CFLAGS) $(LDFLAGS) -o $@
 
 rasm.exe: rasm.c *.c *.h $(ALLDEPS)
-	$(CCWIN) $< $(CFLAGS) -o $@
+	$(CCWIN) $< $(CFLAGS) -fno-asynchronous-unwind-tables -o $@
 
 clean:
 	rm -f rasm rasm.exe
