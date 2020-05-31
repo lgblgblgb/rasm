@@ -1,6 +1,6 @@
 #define PROGRAM_NAME      "RASM"
-#define PROGRAM_VERSION   "0.120"
-#define PROGRAM_DATE      "xx/12/2019"
+#define PROGRAM_VERSION   "0.123"
+#define PROGRAM_DATE      "xx/06/2020"
 #define PROGRAM_COPYRIGHT "© 2017 BERGE Edouard / roudoudou from Resistance"
 
 #define RASM_VERSION PROGRAM_NAME" v"PROGRAM_VERSION" (build "PROGRAM_DATE")"
@@ -14,6 +14,7 @@
 #define TRACE_MAKEAMSDOSREAL 0
 #define TRACE_STRUCT 0
 #define TRACE_EDSK 0
+#define TRACE_LABEL 0
 
 
 
@@ -45,21 +46,21 @@ arising from,  out of  or in connection  with  the software  or  the  use  or  o
 Software. »
 -----------------------------------------------------------------------------------------------------
 Linux compilation with GCC or Clang:
-cc rasm_v0116.c -O2 -lm -lrt -march=native -o rasm
+cc rasm_v0122.c -O2 -lm -lrt -march=native -o rasm
 strip rasm
 
 Windows compilation with Visual studio:
-cl.exe rasm_v0116.c -O2 -Ob3
+cl.exe rasm_v0122.c -O2 -Ob3
 
 pure MS-DOS 32 bits compilation with Watcom:
-wcl386 rasm_v0116.c -6r -6s -fp6 -d0 -k4000000 -ox /bt=DOS /l=dos4g
+wcl386 rasm_v0122.c -6r -6s -fp6 -d0 -k4000000 -ox /bt=DOS /l=dos4g
 
 MorphOS compilation (ixemul):
-ppc-morphos-gcc-5 -O2 -c -o rasm rasm_v0116.c
+ppc-morphos-gcc-5 -O2 -c -o rasm rasm_v0122.c
 strip rasm
 
 MacOS compilation:
-cc rasm_v0116.c -O2 -lm -march=native -o rasm
+cc rasm_v0122.c -O2 -lm -march=native -o rasm
 
 */
 
@@ -90,6 +91,7 @@ cc rasm_v0116.c -O2 -lm -march=native -o rasm
 #include"zx7.h"
 #include"lz4.h"
 #include"exomizer.h"
+#include"apultra.h"
 #endif
 
 #ifdef __MORPHOS__
@@ -143,11 +145,13 @@ struct s_parameter {
 	int export_snabrk;
 	int export_brk;
 	int nowarning;
+	int erronwarn;
 	int checkmode;
 	int dependencies;
 	int maxerr;
 	int macrovoid;
 	int extended_error;
+	int display_stats;
 	int edskoverwrite;
 	float rough;
 	int as80,dams;
@@ -299,6 +303,7 @@ struct s_expression {
 	int lz;                   /* lz zone */
 	int ibank;                /* ibank of expression */
 	int iorgzone;             /* org of expression */
+	char *module;
 };
 
 struct s_expr_dico {
@@ -537,7 +542,9 @@ struct s_macro {
 };
 
 struct s_macro_position {
-	int start,end,value;
+	int start,end,value,level,pushed;
+	//char *lastlocal;
+	//int lastlocalen,lastlocalalloc;
 };
 
 /* preprocessing only */
@@ -794,7 +801,7 @@ struct s_assenv {
 	int nberr,flux;
 	int fastmatch[256];
 	unsigned char charset[256];
-	int maxerr,extended_error,nowarning;
+	int maxerr,extended_error,nowarning,erronwarn;
 	/* ORG tracking */
 	int codeadr,outputadr,nocode;
 	int codeadrbackup,outputadrbackup;
@@ -826,8 +833,10 @@ struct s_assenv {
 	struct s_breakpoint *breakpoint;
 	int ibreakpoint,maxbreakpoint;
 	char *lastgloballabel;
-	char *lastsuperglobal;
+	//char *lastsuperglobal;
 	int lastgloballabellen, lastglobalalloc;
+	char **globalstack; /* retrieve back global from previous scope */
+	int igs,mgs;
 	/* repeat */
 	struct s_repeat *repeat;
 	int ir,mr;
@@ -906,6 +915,7 @@ struct s_assenv {
 	int checkmode,dependencies;
 	int stop;
 	int warn_unused;
+	int display_stats;
 	/* debug */
 	struct s_rasm_info debug;
 	struct s_rasm_info **retdebug;
@@ -1509,9 +1519,9 @@ printf("filename=[%s]\n",filename);
 
 }
 
-char *GetPath(char *filename) {
+char *rasm_GetPath(char *filename) {
 	#undef FUNC
-	#define FUNC "GetPath"
+	#define FUNC "rasm_GetPath"
 
 	static char curpath[PATH_MAX];
 	int zelen,idx;
@@ -1570,10 +1580,10 @@ char *MergePath(struct s_assenv *ae,char *dadfilename, char *filename) {
 		exit(-111);
 	} else {
 		if (filename[0]=='.' && filename[1]=='\\') {
-			strcpy(curpath,GetPath(dadfilename));
+			strcpy(curpath,rasm_GetPath(dadfilename));
 			strcat(curpath,filename+2);
 		} else {
-			strcpy(curpath,GetPath(dadfilename));
+			strcpy(curpath,rasm_GetPath(dadfilename));
 			strcat(curpath,filename);
 		}
 	}
@@ -1582,10 +1592,10 @@ char *MergePath(struct s_assenv *ae,char *dadfilename, char *filename) {
 		/* chemin absolu */
 		strcpy(curpath,filename);
 	} else if (filename[0]=='.' && filename[1]=='/') {
-		strcpy(curpath,GetPath(dadfilename));
+		strcpy(curpath,rasm_GetPath(dadfilename));
 		strcat(curpath,filename+2);
 	} else {
-		strcpy(curpath,GetPath(dadfilename));
+		strcpy(curpath,rasm_GetPath(dadfilename));
 		strcat(curpath,filename);
 	}
 #endif
@@ -1689,12 +1699,14 @@ int StringIsMem(char *w)
 					break;
 				case '(':p++;break;
 				case ')':p--;
+					/* si on sort de la première parenthèse */
 					if (!p && w[idx+1]) return 0;
 					break;
 				default:break;
 			}
 			idx++;
 		}
+		/* si on ne termine pas par une parenthèse */
 		if (w[idx-1]!=')') return 0;
 	} else {
 		return 0;
@@ -1702,6 +1714,8 @@ int StringIsMem(char *w)
 	return 1;
 
 }
+
+
 int StringIsQuote(char *w)
 {
 	#undef FUNC
@@ -2169,7 +2183,10 @@ void FreeAssenv(struct s_assenv *ae)
 	/* free labels, expression, orgzone, repeat, ... */
 	if (ae->mo) MemFree(ae->orgzone);
 	if (ae->me) {
-		for (i=0;i<ae->ie;i++) if (ae->expression[i].reference) MemFree(ae->expression[i].reference);
+		for (i=0;i<ae->ie;i++) {
+			if (ae->expression[i].reference) MemFree(ae->expression[i].reference);
+			if (ae->expression[i].module) MemFree(ae->expression[i].module);
+		}
 		MemFree(ae->expression);
 	}
 	if (ae->mh) {
@@ -2364,7 +2381,7 @@ void ___output_set_limit(struct s_assenv *ae,int zelimit)
 	#undef FUNC
 	#define FUNC "___output_set_limit"
 
-	int limit=65535;
+	int limit=65536;
 	
 	if (zelimit<=limit) {
 		/* apply limit */
@@ -2373,7 +2390,7 @@ void ___output_set_limit(struct s_assenv *ae,int zelimit)
 		MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"limit exceed hardware limitation!");
 		ae->stop=1;
 	}
-	if (ae->outputadr>=0 && ae->outputadr>limit) {
+	if (ae->outputadr>=0 && ae->outputadr>=limit) {
 		MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"limit too high for current output!");
 		ae->stop=1;
 	}
@@ -2729,8 +2746,10 @@ void WarnLabelTreeRecurse(struct s_assenv *ae, struct s_crclabel_tree *lt)
 		if (!lt->label[i].used) {
 			if (!lt->label[i].name) {
 				rasm_printf(ae,KWARNING"[%s:%d] Warning: label %s declared but not used\n",ae->filename[lt->label[i].fileidx],lt->label[i].fileline,ae->wl[lt->label[i].iw].w);
+				if (ae->erronwarn) MaxError(ae);
 			} else {
 				rasm_printf(ae,KWARNING"[%s:%d] Warning: label %s declared but not used\n",ae->filename[lt->label[i].fileidx],lt->label[i].fileline,lt->label[i].name);
+				if (ae->erronwarn) MaxError(ae);
 			}
 		}
 	}
@@ -2764,6 +2783,7 @@ void WarnDicoTreeRecurse(struct s_assenv *ae, struct s_crcdico_tree *lt)
 	for (i=0;i<lt->ndico;i++) {
 		if (strcmp(lt->dico[i].name,"IX") && strcmp(lt->dico[i].name,"IY") && strcmp(lt->dico[i].name,"PI") && strcmp(lt->dico[i].name,"ASSEMBLER_RASM") && lt->dico[i].autorise_export) {
 			rasm_printf(ae,KWARNING"[%s:%d] Warning: variable %s declared but not used\n",ae->filename[ae->wl[lt->dico[i].iw].ifile],ae->wl[lt->dico[i].iw].l,lt->dico[i].name);
+				if (ae->erronwarn) MaxError(ae);
 		}
 	}
 }
@@ -3991,10 +4011,63 @@ double ComputeExpressionCore(struct s_assenv *ae,char *original_zeexpression,int
 							*/
 							if (page!=3) {
 
-#if TRACE_COMPUTE_EXPRESSION
-printf("search label [%s]\n",ae->computectx->varbuffer+minusptr+bank);
+
+
+if (didx>0 && didx<ae->ie) {
+	if (ae->expression[didx].module) {
+		char *dblvarbuffer;
+#if TRACE_LABEL || TRACE_COMPUTE_EXPRESSION
+		printf("search label [%s] in an expression / module=[%s]\n",ae->computectx->varbuffer+minusptr+bank,ae->expression[didx].module);
 #endif
-								curlabel=SearchLabel(ae,ae->computectx->varbuffer+minusptr+bank,crc);
+		dblvarbuffer=MemMalloc(strlen(ae->computectx->varbuffer)+strlen(ae->expression[didx].module)+2);
+
+		strcpy(dblvarbuffer,ae->expression[didx].module);
+		strcat(dblvarbuffer,"_");
+		strcat(dblvarbuffer,ae->computectx->varbuffer+minusptr+bank);
+
+		/* on essaie toujours de trouver le label du module courant */	
+		curlabel=SearchLabel(ae,dblvarbuffer,GetCRC(dblvarbuffer));
+		MemFree(dblvarbuffer);
+	} else {
+#if TRACE_LABEL || TRACE_COMPUTE_EXPRESSION
+		printf("search label [%s] in an expression without module\n",ae->computectx->varbuffer+minusptr+bank);
+#endif
+		curlabel=NULL;
+	}
+
+	/* pas trouvé on cherche LEGACY */
+	if (!curlabel) curlabel=SearchLabel(ae,ae->computectx->varbuffer+minusptr+bank,crc);
+#if TRACE_LABEL || TRACE_COMPUTE_EXPRESSION
+	else printf("label trouve via ajout du MODULE\n");
+#endif
+
+} else {
+#if TRACE_LABEL || TRACE_COMPUTE_EXPRESSION
+	printf("search label [%s] outside an expression taking current module!\n",ae->computectx->varbuffer+minusptr+bank);
+#endif
+	if (ae->module) {
+		char *dblvarbuffer;
+		dblvarbuffer=MemMalloc(strlen(ae->computectx->varbuffer)+strlen(ae->module)+2);
+		strcpy(dblvarbuffer,ae->module);
+		strcat(dblvarbuffer,"_");
+		strcat(dblvarbuffer,ae->computectx->varbuffer+minusptr+bank);
+
+		/* on essaie toujours de trouver le label du module courant */	
+		curlabel=SearchLabel(ae,dblvarbuffer,GetCRC(dblvarbuffer));
+		/* pas trouvé on cherche LEGACY */
+		if (!curlabel) curlabel=SearchLabel(ae,ae->computectx->varbuffer+minusptr+bank,crc);
+#if TRACE_LABEL || TRACE_COMPUTE_EXPRESSION
+		else printf("label trouve via ajout du MODULE\n");
+#endif
+
+		MemFree(dblvarbuffer);
+	} else {
+		curlabel=SearchLabel(ae,ae->computectx->varbuffer+minusptr+bank,crc);
+	}
+}
+
+
+
 								if (curlabel) {
 									if (ae->stage<2) {
 										if (curlabel->lz==-1) {
@@ -4151,19 +4224,22 @@ printf("stage 2 | page=%d | ptr=%X ibank=%d\n",page,curlabel->ptr,curlabel->iban
 											validx=atoi(ae->computectx->varbuffer+reverse_idx);
 											structlabel=TxtStrDup(ae->computectx->varbuffer+minusptr);
 											structlabel[reverse_idx-minusptr]=0;
-#ifdef TRACE_STRUCT
+#if TRACE_STRUCT
 			printf("EVOL 119 -> looking for struct %s IDX=%d\n",structlabel,validx);
 #endif
 											/* unoptimized search in structures aliases */
 											crc=GetCRC(structlabel);
 											for (i=0;i<ae->irasmstructalias;i++) {
 												if (ae->rasmstructalias[i].crc==crc && strcmp(ae->rasmstructalias[i].name,structlabel)==0) {
-#ifdef TRACE_STRUCT
+#if TRACE_STRUCT
 							printf("EVOL 119 -> found! ptr=%d size=%d\n",ae->rasmstructalias[i].ptr,ae->rasmstructalias[i].size);
 #endif
 													curval=ae->rasmstructalias[i].size*validx+ae->rasmstructalias[i].ptr;
 													if (validx>=ae->rasmstructalias[i].nbelem) {
-														if (!ae->nowarning) rasm_printf(ae,KWARNING"[%s:%d] Warning: index out of array size!\n",GetExpFile(ae,didx),GetExpLine(ae,didx));
+														if (!ae->nowarning) {
+															rasm_printf(ae,KWARNING"[%s:%d] Warning: index out of array size!\n",GetExpFile(ae,didx),GetExpLine(ae,didx));
+															if (ae->erronwarn) MaxError(ae);
+														}
 													}
 													break;
 												}
@@ -4446,6 +4522,7 @@ printf("ajout de la fonction\n");
 								if (((int)accu[paccu-1])>31 || ((int)accu[paccu-1])<-31) {
 									if (!ae->nowarning) {
 										rasm_printf(ae,KWARNING"Warning - shifting %d is architecture dependant, result forced to ZERO\n",(int)accu[paccu-1]);
+															if (ae->erronwarn) MaxError(ae);
 									}
 									accu[paccu-2]=0;
 								}
@@ -4454,6 +4531,7 @@ printf("ajout de la fonction\n");
 								if (((int)accu[paccu-1])>31 || ((int)accu[paccu-1])<-31) {
 									if (!ae->nowarning) {
 										rasm_printf(ae,KWARNING"Warning - shifting %d is architecture dependant, result forced to ZERO\n",(int)accu[paccu-1]);
+															if (ae->erronwarn) MaxError(ae);
 									}
 									accu[paccu-2]=0;
 								}
@@ -4554,6 +4632,7 @@ printf("ajout de la fonction\n");
 								if (((int)accu[paccu-1])>31 || ((int)accu[paccu-1])<-31) {
 									if (!ae->nowarning) {
 										rasm_printf(ae,KWARNING"Warning - shifting %d is architecture dependant, result forced to ZERO\n",(int)accu[paccu-1]);
+															if (ae->erronwarn) MaxError(ae);
 									}
 									accu[paccu-2]=0;
 								}
@@ -4562,6 +4641,7 @@ printf("ajout de la fonction\n");
 								if (((int)accu[paccu-1])>31 || ((int)accu[paccu-1])<-31) {
 									if (!ae->nowarning) {
 										rasm_printf(ae,KWARNING"Warning - shifting %d is architecture dependant, result forced to ZERO\n",(int)accu[paccu-1]);
+															if (ae->erronwarn) MaxError(ae);
 									}
 									accu[paccu-2]=0;
 								}
@@ -4802,6 +4882,7 @@ printf("***********\n");
 									 if (v>31 || v<-31) {
 										if (!ae->nowarning) {
                                                                 			rasm_printf(ae,KWARNING"Warning - shifting %d is architecture dependant, result forced to ZERO\n",(int)v);
+															if (ae->erronwarn) MaxError(ae);
 										}
 										curdic->v=0;
 									 }
@@ -4810,6 +4891,7 @@ printf("***********\n");
 									 if (v>31 || v<-31) {
 										if (!ae->nowarning) {
                                                                 			rasm_printf(ae,KWARNING"Warning - shifting %d is architecture dependant, result forced to ZERO\n",(int)v);
+															if (ae->erronwarn) MaxError(ae);
 										}
 										curdic->v=0;
 									 }
@@ -5032,24 +5114,27 @@ void ExpressionFastTranslate(struct s_assenv *ae, char **ptr_expr, int fullrepla
 			/* pour les affectations ou les tests conditionnels on ne remplace pas le dico (pour le Push oui par contre!) */
 			if (fullreplace) {
 				if (varbuffer[0]=='$' && !varbuffer[1]) {
-					#ifdef OS_WIN
-					snprintf(curval,sizeof(curval)-1,"%d",ae->codeadr);
-					newlen=strlen(curval);
-					#else
-					newlen=snprintf(curval,sizeof(curval)-1,"%d",ae->codeadr);
-					#endif
-					lenw=strlen(expr);
-					if (newlen>ivar) {
-						/* realloc bigger */
-						expr=*ptr_expr=MemRealloc(expr,lenw+newlen-ivar+1);
+					if (!ae->lz) {
+						#ifdef OS_WIN
+						snprintf(curval,sizeof(curval)-1,"%d",ae->codeadr);
+						newlen=strlen(curval);
+						#else
+						newlen=snprintf(curval,sizeof(curval)-1,"%d",ae->codeadr);
+						#endif
+						lenw=strlen(expr);
+						if (newlen>ivar) {
+							/* realloc bigger */
+							expr=*ptr_expr=MemRealloc(expr,lenw+newlen-ivar+1);
+						}
+						if (newlen!=ivar ) {
+							MemMove(expr+startvar+newlen,expr+startvar+ivar,lenw-startvar-ivar+1);
+							found_replace=1;
+						}
+						strncpy(expr+startvar,curval,newlen); /* copy without zero terminator */
+						idx=startvar+newlen;
+						ivar=0;
 					}
-					if (newlen!=ivar ) {
-						MemMove(expr+startvar+newlen,expr+startvar+ivar,lenw-startvar-ivar+1);
-						found_replace=1;
-					}
-					strncpy(expr+startvar,curval,newlen); /* copy without zero terminator */
-					idx=startvar+newlen;
-					ivar=0;
+					/* qu'on le remplace ou pas on passe a la suite */
 					found_replace=1;
 				} else {
 					curdic=SearchDico(ae,varbuffer,crc);
@@ -5079,7 +5164,7 @@ void ExpressionFastTranslate(struct s_assenv *ae, char **ptr_expr, int fullrepla
 					}
 				}
 			}
-			/* on cherche aussi dans les labels existants */
+			/* on cherche aussi dans les labels existants => priorité aux modules!!! */
 			if (!found_replace) {
 				curlabel=SearchLabel(ae,varbuffer,crc);
 				if (curlabel) {
@@ -5375,8 +5460,11 @@ void PushExpression(struct s_assenv *ae,int iw,enum e_expression zetype)
 		curexp.ibank=ae->activebank;
 		curexp.iorgzone=ae->io-1;
 		curexp.lz=ae->lz;
+		/* need the module to know where we are */
+		if (ae->module) curexp.module=TxtStrDup(ae->module); else curexp.module=NULL;
 		/* on traduit de suite les variables du dictionnaire pour les boucles et increments
-			SAUF si c'est une affectation */
+			SAUF si c'est une affectation 
+		*/
 		if (!ae->wl[iw].e) {
 			switch (zetype) {
 				case E_EXPRESSION_V16C:
@@ -5555,10 +5643,16 @@ char *MakeAMSDOS_name(struct s_assenv *ae, char *filename)
 	char *pp;
 	/* warning */
 	if (strlen(filename)>12) {
-		if (!ae->nowarning) rasm_printf(ae,KWARNING"Warning - filename [%s] too long for AMSDOS, will be truncated\n",filename);
+		if (!ae->nowarning) {
+			rasm_printf(ae,KWARNING"Warning - filename [%s] too long for AMSDOS, will be truncated\n",filename);
+			if (ae->erronwarn) MaxError(ae);
+		}
 	} else if ((pp=strchr(filename,'.'))!=NULL) {
 		if (pp-filename>8) {
-			if (!ae->nowarning) rasm_printf(ae,KWARNING"Warning - filename [%s] too long for AMSDOS, will be truncated\n",filename);
+			if (!ae->nowarning) {
+				rasm_printf(ae,KWARNING"Warning - filename [%s] too long for AMSDOS, will be truncated\n",filename);
+			if (ae->erronwarn) MaxError(ae);
+			}
 		}
 	}
 	/* copy filename */
@@ -5618,6 +5712,7 @@ void EDSK_load(struct s_assenv *ae,struct s_edsk_wrapper *curwrap, char *edskfil
 		}
 		if (face>=sidenumber) {
 			rasm_printf(ae,KWARNING"[%s] Warning - DSK has no face %d - DSK updated\n",edskfilename,face);
+			if (ae->erronwarn) MaxError(ae);
 			return;
 		}
 
@@ -5699,6 +5794,7 @@ void EDSK_load(struct s_assenv *ae,struct s_edsk_wrapper *curwrap, char *edskfil
 		}
 		if (face>=sidenumber) {
 			rasm_printf(ae,KWARNING"[%s] EDSK has no face %d - DSK updated\n",edskfilename,face);
+			if (ae->erronwarn) MaxError(ae);
 			return;
 		}
 
@@ -5761,6 +5857,7 @@ void EDSK_load(struct s_assenv *ae,struct s_edsk_wrapper *curwrap, char *edskfil
 				}
 				if (track_sectorsize!=2) {
 					rasm_printf(ae,KWARNING"track %02d has invalid sector size but sectors are OK\n",t);
+			if (ae->erronwarn) MaxError(ae);
 				}
 #if TRACE_EDSK
 	printf("\n");
@@ -6459,7 +6556,10 @@ void PopAllExpression(struct s_assenv *ae, int crunched_zone)
 			case E_EXPRESSION_3V8:
 			case E_EXPRESSION_V8:
 				if (r>255 || r<-128) {
-					if (!ae->nowarning) rasm_printf(ae,KWARNING"[%s:%d] Warning: truncating value #%X to #%X\n",GetExpFile(ae,i),ae->wl[ae->expression[i].iw].l,r,r&0xFF);
+					if (!ae->nowarning) {
+						rasm_printf(ae,KWARNING"[%s:%d] Warning: truncating value #%X to #%X\n",GetExpFile(ae,i),ae->wl[ae->expression[i].iw].l,r,r&0xFF);
+						if (ae->erronwarn) MaxError(ae);
+					}
 				}
 				mem[ae->expression[i].wptr]=(unsigned char)r;
 				break;
@@ -6468,7 +6568,10 @@ void PopAllExpression(struct s_assenv *ae, int crunched_zone)
 			case E_EXPRESSION_V16C:
 			case E_EXPRESSION_0V16:
 				if (r>65535 || r<-32768) {
-					if (!ae->nowarning) rasm_printf(ae,KWARNING"[%s:%d] Warning: truncating value #%X to #%X\n",GetExpFile(ae,i),ae->wl[ae->expression[i].iw].l,r,r&0xFFFF);
+					if (!ae->nowarning) {
+						rasm_printf(ae,KWARNING"[%s:%d] Warning: truncating value #%X to #%X\n",GetExpFile(ae,i),ae->wl[ae->expression[i].iw].l,r,r&0xFFFF);
+						if (ae->erronwarn) MaxError(ae);
+					}
 				}
 				mem[ae->expression[i].wptr]=(unsigned char)r&0xFF;
 				mem[ae->expression[i].wptr+1]=(unsigned char)((r&0xFF00)>>8);
@@ -6476,7 +6579,10 @@ void PopAllExpression(struct s_assenv *ae, int crunched_zone)
 			case E_EXPRESSION_0V32:
 				/* meaningless in 32 bits architecture... */
 				if (v>4294967295 || v<-2147483648) {
-					if (!ae->nowarning) rasm_printf(ae,KWARNING"[%s:%d] Warning: truncating value\n",GetExpFile(ae,i),ae->wl[ae->expression[i].iw].l);
+					if (!ae->nowarning) {
+						rasm_printf(ae,KWARNING"[%s:%d] Warning: truncating value\n",GetExpFile(ae,i),ae->wl[ae->expression[i].iw].l);
+						if (ae->erronwarn) MaxError(ae);
+					}
 				}
 				mem[ae->expression[i].wptr]=(unsigned char)r&0xFF;
 				mem[ae->expression[i].wptr+1]=(unsigned char)((r>>8)&0xFF);
@@ -6514,20 +6620,29 @@ void PopAllExpression(struct s_assenv *ae, int crunched_zone)
 				break;
 			case E_EXPRESSION_RUN:
 				if (r<0 || r>65535) {
-					if (!ae->nowarning) rasm_printf(ae,KWARNING"[%s:%d] Warning: run adress truncated from %X to %X\n",GetExpFile(ae,i),ae->wl[ae->expression[i].iw].l,r,r&0xFFFF);
+					if (!ae->nowarning) {
+						rasm_printf(ae,KWARNING"[%s:%d] Warning: run adress truncated from %X to %X\n",GetExpFile(ae,i),ae->wl[ae->expression[i].iw].l,r,r&0xFFFF);
+						if (ae->erronwarn) MaxError(ae);
+					}
 				}
 				ae->snapshot.registers.LPC=r&0xFF;
 				ae->snapshot.registers.HPC=(r>>8)&0xFF;
 				break;			
 			case E_EXPRESSION_ZXRUN:
 				if (r<0 || r>65535) {
-					if (!ae->nowarning) rasm_printf(ae,KWARNING"[%s:%d] Warning: run adress truncated from %X to %X\n",GetExpFile(ae,i),ae->wl[ae->expression[i].iw].l,r,r&0xFFFF);
+					if (!ae->nowarning) {
+						rasm_printf(ae,KWARNING"[%s:%d] Warning: run adress truncated from %X to %X\n",GetExpFile(ae,i),ae->wl[ae->expression[i].iw].l,r,r&0xFFFF);
+						if (ae->erronwarn) MaxError(ae);
+					}
 				}
 				ae->zxsnapshot.run=r&0xFFFF;
 				break;			
 			case E_EXPRESSION_ZXSTACK:
 				if (r<0 || r>65535) {
-					if (!ae->nowarning) rasm_printf(ae,KWARNING"[%s:%d] Warning: stack adress truncated from %X to %X\n",GetExpFile(ae,i),ae->wl[ae->expression[i].iw].l,r,r&0xFFFF);
+					if (!ae->nowarning) {
+						rasm_printf(ae,KWARNING"[%s:%d] Warning: stack adress truncated from %X to %X\n",GetExpFile(ae,i),ae->wl[ae->expression[i].iw].l,r,r&0xFFFF);
+						if (ae->erronwarn) MaxError(ae);
+					}
 				}
 				ae->zxsnapshot.stack=r&0xFFFF;
 				break;
@@ -6592,7 +6707,7 @@ void PushLabel(struct s_assenv *ae)
 	
 	struct s_label curlabel={0},*searched_label;
 	char *curlabelname;
-	int i;
+	int i,im;
 	/* label with counters */
 	struct s_expr_dico *curdic;
 	char curval[32];
@@ -6601,6 +6716,9 @@ void PushLabel(struct s_assenv *ae)
 	int taglen,tagidx,lenw,tagcount=0;
 	int crc,newlen,touched;
 
+#if TRACE_LABEL
+	printf("check label [%s]\n",ae->wl[ae->idx].w);
+#endif
 	if (ae->AutomateValidLabelFirst[ae->wl[ae->idx].w[0]]) {
 		for (i=1;ae->wl[ae->idx].w[i];i++) {
 			if (ae->wl[ae->idx].w[i]=='{') tagcount++; else if (ae->wl[ae->idx].w[i]=='}') tagcount--;
@@ -6661,12 +6779,17 @@ void PushLabel(struct s_assenv *ae)
 	   v a r i a b l e s     i n    l a b e l    n a m e
 	*******************************************************/
 	varbuffer=TranslateTag(ae,TxtStrDup(ae->wl[ae->idx].w),&touched,1,E_TAGOPTION_NONE);
-	
+#if TRACE_LABEL
+	printf("label after translation [%s]\n",varbuffer);
+#endif
 	/**************************************************
 	   s t r u c t u r e     d e c l a r a t i o n
 	**************************************************/
 	if (ae->getstruct) {
 		struct s_rasmstructfield rasmstructfield={0};
+#if TRACE_LABEL
+	printf("label used for structs! [%s]\n",varbuffer);
+#endif
 		if (varbuffer[0]=='@') {
 			MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"Please no local label in a struct [%s]\n",ae->wl[ae->idx].w);
 			return;
@@ -6693,6 +6816,9 @@ void PushLabel(struct s_assenv *ae)
 		**************************************************/
 		/* labels locaux */
 		if (varbuffer[0]=='@' && (ae->ir || ae->iw || ae->imacro)) {
+#if TRACE_LABEL
+	printf("PUSH LOCAL\n");
+#endif
 			curlabel.iw=-1;
 			curlabel.local=1;
 			curlabelname=curlabel.name=MakeLocalLabel(ae,varbuffer,NULL);
@@ -6704,10 +6830,25 @@ void PushLabel(struct s_assenv *ae)
 				MemFree(ae->lastgloballabel);
 			}
 			ae->lastgloballabel=TxtStrDup(curlabelname);
-//printf("push LOCAL as reference for proximity label -> [%s]\n",ae->lastgloballabel);
+
+			/* pour les inceptions de macros */
+			if (ae->imacropos) {
+				for (im=ae->imacropos-1;im>=0;im--) {
+					if (ae->idx>=ae->macropos[im].start && ae->idx<ae->macropos[im].end) break;
+				}
+				if (im>=0) {
+					/* on met à jour le local/global en niveau de macro ??? */
+				}
+			}
+//printf("push LOCAL as reference [%d] for proximity label -> [%s]\n",im, ae->lastgloballabel);
+
+
 			ae->lastgloballabellen=strlen(ae->lastgloballabel);
 			ae->lastglobalalloc=1;
 		} else {
+#if TRACE_LABEL
+	printf("PUSH GLOBAL or PROXIMITY\n");
+#endif
 			switch (varbuffer[0]) {
 				case '.':
 					if (ae->dams) {
@@ -6736,10 +6877,15 @@ void PushLabel(struct s_assenv *ae)
 							curlabel.iw=-1;
 							curlabel.name=varbuffer=curlabelname;
 							curlabel.crc=GetCRC(varbuffer);
-//printf("push proximity label that may be exported [%s]->[%s]\n",ae->wl[ae->idx].w,varbuffer);
+#if TRACE_LABEL
+printf("PUSH PROXIMITY label that may be exported [%s]->[%s]\n",ae->wl[ae->idx].w,varbuffer);
+#endif
 						} else {
 							/* MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"cannot create proximity label [%s] as there is no previous global label\n",varbuffer);
 							return; */
+#if TRACE_LABEL
+printf("PUSH Orphan PROXIMITY label that cannot be exported [%s]->[%s]\n",ae->wl[ae->idx].w,varbuffer);
+#endif
 
 							// not optimal but!
 							curlabelname=TxtStrDup(varbuffer);
@@ -6752,6 +6898,9 @@ void PushLabel(struct s_assenv *ae)
 					}
 					break;
 				default:
+#if TRACE_LABEL
+	printf("PUSH => GLOBAL\n");
+#endif
 					if (!touched) {
 						curlabel.iw=ae->idx;
 					} else {
@@ -6763,12 +6912,30 @@ void PushLabel(struct s_assenv *ae)
 					/* global labels set new reference */
 					if (ae->lastglobalalloc) MemFree(ae->lastgloballabel);
 					ae->lastgloballabel=ae->wl[ae->idx].w;
-					ae->lastsuperglobal=ae->wl[ae->idx].w;
+					//ae->lastsuperglobal=ae->wl[ae->idx].w;
 					ae->lastgloballabellen=strlen(ae->wl[ae->idx].w);
 					ae->lastglobalalloc=0;
 //printf("SET global label [%s] l=%d\n",ae->lastgloballabel,ae->lastgloballabellen);
 					break;
 			}
+
+
+			if (varbuffer[0]!='@' && ae->module && ae->modulen) {
+				curlabelname=MemMalloc(strlen(varbuffer)+ae->modulen+2);
+				strcpy(curlabelname,ae->module);
+				strcat(curlabelname,"_");
+				strcat(curlabelname,varbuffer);
+				varbuffer=curlabelname;
+				curlabel.crc=GetCRC(varbuffer);
+				/* cause realloc */
+				touched=1;
+				curlabel.iw=-1;
+				curlabel.name=varbuffer;
+			}
+#if TRACE_LABEL
+	if (varbuffer[0]!='@') printf("PUSH => ADD MODULE [%s] => [%s]\n",ae->module?ae->module:"(null)",varbuffer);
+	else printf("PUSH => NO MODULE for local label\n");
+#endif
 
 			/* contrôle dico uniquement avec des labels non locaux */
 			if (SearchDico(ae,curlabelname,curlabel.crc)) {
@@ -9649,6 +9816,33 @@ void __BUILDTAPE(struct s_assenv *ae) {
 }
 	
 
+void __LZAPU(struct s_assenv *ae) {
+	struct s_lz_section curlz;
+	
+	if (!ae->wl[ae->idx].t) {
+		MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"LZ directive does not need any parameter\n");
+		return;
+	}
+	#ifdef NO_3RD_PARTIES
+		MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"Cannot use 3rd parties cruncher with this version of RASM\n",GetCurrentFile(ae),ae->wl[ae->idx].l);
+		FreeAssenv(ae);
+		exit(-5);
+	#endif
+	
+	if (ae->lz>=0 && ae->lz<ae->ilz) {
+		MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"Cannot start a new LZ section inside another one (%d)\n",GetCurrentFile(ae),ae->wl[ae->idx].l,ae->lz);
+		FreeAssenv(ae);
+		exit(-5);
+	}
+	curlz.iw=ae->idx;
+	curlz.iorgzone=ae->io-1;
+	curlz.ibank=ae->activebank;
+	curlz.memstart=ae->outputadr;
+	curlz.memend=-1;
+	curlz.lzversion=17;
+	ae->lz=ae->ilz;
+	ObjectArrayAddDynamicValueConcat((void**)&ae->lzsection,&ae->ilz,&ae->mlz,&curlz,sizeof(curlz));
+}
 void __LZ4(struct s_assenv *ae) {
 	struct s_lz_section curlz;
 	
@@ -9840,7 +10034,10 @@ void ___new_memory_space(struct s_assenv *ae)
 		ae->orgzone[ae->io-1].memend=ae->outputadr;
 	}
 	if (ae->lz>=0) {
-		if (!ae->nowarning) rasm_printf(ae,KWARNING"[%s:%d] Warning: LZ section wasn't closed before a new memory space directive\n",GetCurrentFile(ae),ae->wl[ae->idx].l);
+		if (!ae->nowarning) {
+			rasm_printf(ae,KWARNING"[%s:%d] Warning: LZ section wasn't closed before a new memory space directive\n",GetCurrentFile(ae),ae->wl[ae->idx].l);
+			if (ae->erronwarn) MaxError(ae);
+		}
 		__LZCLOSE(ae);
 	}
 	ae->activebank=ae->nbbank;
@@ -9920,7 +10117,10 @@ void __BANK(struct s_assenv *ae) {
 		return;
 	}
 	if (ae->lz>=0) {
-		if (!ae->nowarning) rasm_printf(ae,KWARNING"[%s:%d] Warning: LZ section wasn't closed before a new BANK directive\n",GetCurrentFile(ae),ae->wl[ae->idx].l);
+		if (!ae->nowarning) {
+			rasm_printf(ae,KWARNING"[%s:%d] Warning: LZ section wasn't closed before a new BANK directive\n",GetCurrentFile(ae),ae->wl[ae->idx].l);
+			if (ae->erronwarn) MaxError(ae);
+		}
 		__LZCLOSE(ae);
 	}
 
@@ -9984,7 +10184,10 @@ void __BANKSET(struct s_assenv *ae) {
 		return;
 	}
 	if (ae->lz>=0) {
-		if (!ae->nowarning) rasm_printf(ae,KWARNING"[%s:%d] Warning: LZ section wasn't closed before a new BANKSET directive\n",GetCurrentFile(ae),ae->wl[ae->idx].l);
+		if (!ae->nowarning) {
+			rasm_printf(ae,KWARNING"[%s:%d] Warning: LZ section wasn't closed before a new BANKSET directive\n",GetCurrentFile(ae),ae->wl[ae->idx].l);
+			if (ae->erronwarn) MaxError(ae);
+		}
 		__LZCLOSE(ae);
 	}
 
@@ -10052,7 +10255,10 @@ void __WRITE(struct s_assenv *ae) {
 				__BANK(ae);	
 				ok=1;
 			} else {
-				if (!ae->nowarning) rasm_printf(ae,KWARNING"[%s:%d] Warning: WRITE DIRECT lower ROM ignored (value %d out of bounds 0-7)\n",GetCurrentFile(ae),ae->wl[ae->idx].l,lower);
+				if (!ae->nowarning) {
+					rasm_printf(ae,KWARNING"[%s:%d] Warning: WRITE DIRECT lower ROM ignored (value %d out of bounds 0-7)\n",GetCurrentFile(ae),ae->wl[ae->idx].l,lower);
+					if (ae->erronwarn) MaxError(ae);
+				}
 			}
 		} else if (upper!=-1) {
 			if (upper>=0 && ((ae->forcecpr && upper<32) || (ae->forcesnapshot && upper<BANK_MAX_NUMBER))) {
@@ -10061,15 +10267,24 @@ void __WRITE(struct s_assenv *ae) {
 				ok=1;
 			} else {
 				if (!ae->forcecpr && !ae->forcesnapshot) {
-					if (!ae->nowarning) rasm_printf(ae,KWARNING"[%s:%d] Warning: WRITE DIRECT select a ROM without cartridge output\n",GetCurrentFile(ae),ae->wl[ae->idx].l);
+					if (!ae->nowarning) {
+						rasm_printf(ae,KWARNING"[%s:%d] Warning: WRITE DIRECT select a ROM without cartridge output\n",GetCurrentFile(ae),ae->wl[ae->idx].l);
+						if (ae->erronwarn) MaxError(ae);
+					}
 				} else {
-					if (!ae->nowarning) rasm_printf(ae,KWARNING"[%s:%d] Warning: WRITE DIRECT upper ROM ignored (value %d out of bounds 0-31)\n",GetCurrentFile(ae),ae->wl[ae->idx].l,upper);
+					if (!ae->nowarning) {
+						rasm_printf(ae,KWARNING"[%s:%d] Warning: WRITE DIRECT upper ROM ignored (value %d out of bounds 0-31)\n",GetCurrentFile(ae),ae->wl[ae->idx].l,upper);
+						if (ae->erronwarn) MaxError(ae);
+					}
 				}
 			}
 		} else if (bank!=-1) {
 			/* selection de bank on ouvre un nouvel espace */
 		} else {
-			if (!ae->nowarning) rasm_printf(ae,KWARNING"[%s:%d] Warning: meaningless WRITE DIRECT\n",GetCurrentFile(ae),ae->wl[ae->idx].l);
+			if (!ae->nowarning) {
+				rasm_printf(ae,KWARNING"[%s:%d] Warning: meaningless WRITE DIRECT\n",GetCurrentFile(ae),ae->wl[ae->idx].l);
+				if (ae->erronwarn) MaxError(ae);
+			}
 		}
 	}
 	while (!ae->wl[ae->idx].t) ae->idx++;
@@ -10130,6 +10345,40 @@ void __CHARSET(struct s_assenv *ae) {
 	}
 }
 
+void PushGlobal(struct s_assenv *ae) {
+	char *zelast;
+	if (ae->lastgloballabel) zelast=TxtStrDup(ae->lastgloballabel); else zelast=NULL;
+	ObjectArrayAddDynamicValueConcat((void **)&ae->globalstack,&ae->igs,&ae->mgs,&zelast,sizeof(char *));
+
+#if TRACE_LABEL
+printf("==> PushGlobal on Stack [%s] igs=%d\n",zelast,ae->igs);
+#endif
+}
+
+void PopGlobal(struct s_assenv *ae) {
+	if (ae->igs) {
+		ae->igs--;
+#if TRACE_LABEL
+printf("<== PopGlobal on Stack [%s] igs=%d\n",ae->globalstack[ae->igs],ae->igs+1);
+#endif
+
+		if (ae->globalstack[ae->igs]) {
+			ae->lastgloballabel=TxtStrDup(ae->globalstack[ae->igs]);
+			ae->lastgloballabellen=strlen(ae->lastgloballabel);
+			ae->lastglobalalloc=1;
+		} else {
+			ae->lastgloballabel=NULL;
+			ae->lastgloballabellen=0;
+			ae->lastglobalalloc=1;
+		}
+
+		if (ae->globalstack[ae->igs]) MemFree(ae->globalstack[ae->igs]);
+	} else {
+		MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"PopGlobal INTERNAL ERROR / Please report\n");
+	}
+}
+
+
 void __MACRO(struct s_assenv *ae) {
 	struct s_macro curmacro={0};
 	char *referentfilename,*zeparam;
@@ -10144,9 +10393,27 @@ void __MACRO(struct s_assenv *ae) {
 			getparam=0;
 		}
 		/* overload forbidden */
+		/* macro, keywords and directives forbidden */
 		if (SearchMacro(ae,curmacro.crc,curmacro.mnemo)>=0) {
 			MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"Macro already defined with this name\n");
+		} else {
+			if ((SearchDico(ae,ae->wl[ae->idx+1].w,curmacro.crc))!=NULL) {
+				MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"Macro definition: There is already a variable with this name\n");
+			} else {
+				if ((SearchLabel(ae,ae->wl[ae->idx+1].w,curmacro.crc))!=NULL) {
+					MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"Macro definition: There is already a label with this name\n");
+				} else {
+					if ((SearchAlias(ae,curmacro.crc,ae->wl[ae->idx+1].w))!=-1) {
+						MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"Macro definition: There is already an alias with this name\n");
+					} else {
+						if (IsRegister(curmacro.mnemo)) {
+							MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"Macro definition: Cannot choose a register as macro name\n");
+						}
+					}
+				}
+			}
 		}
+
 		idx=ae->idx+2;
 		while (ae->wl[idx].t!=2 && (GetCRC(ae->wl[idx].w)!=CRC_MEND || strcmp(ae->wl[idx].w,"MEND")!=0) && (GetCRC(ae->wl[idx].w)!=CRC_ENDM || strcmp(ae->wl[idx].w,"ENDM")!=0)) {
 			if (GetCRC(ae->wl[idx].w)==CRC_MACRO || strcmp(ae->wl[idx].w,"MACRO")==0) {
@@ -10280,10 +10547,26 @@ struct s_wordlist *__MACRO_EXECUTE(struct s_assenv *ae, int imacro) {
 			for (i=0;i<nbparam;i++) {
 				cpybackup[i]=ae->wl[ae->idx+1+i];
 			}
-			/* insert macro position */
+			/************************
+			  insert macro position
+			*************************/
 			curmacropos.start=ae->idx;
 			curmacropos.end=ae->idx+ae->macro[imacro].nbword;
 			curmacropos.value=ae->macrocounter;
+			/* which level? */
+			curmacropos.pushed=0;
+			if (!ae->imacropos) {
+				curmacropos.level=1;
+			} else {
+				if (ae->macropos[ae->imacropos-1].end<=curmacropos.start) {
+					/* same level */
+					curmacropos.level=ae->macropos[ae->imacropos-1].level;
+				} else {
+					/* inception */
+					curmacropos.level=ae->macropos[ae->imacropos-1].level+1;
+				}
+			}
+
 			ObjectArrayAddDynamicValueConcat((void**)&ae->macropos,&ae->imacropos,&ae->mmacropos,&curmacropos,sizeof(curmacropos));
 			
 			/* are we in a repeat/while block? */
@@ -10432,7 +10715,10 @@ void __RUN(struct s_assenv *ae) {
 				ramconf=RoundComputeExpression(ae,ae->wl[ae->idx+1].w,ae->codeadr,0,0);
 				ae->idx++;
 				if (ramconf<0xC0 || ramconf>0xFF) {
-					if (!ae->nowarning) rasm_printf(ae,KWARNING"[%s:%d] Warning: ram configuration out of bound %X forced to #C0\n",GetCurrentFile(ae),ae->wl[ae->idx].l,ramconf);
+					if (!ae->nowarning) {
+						rasm_printf(ae,KWARNING"[%s:%d] Warning: ram configuration out of bound %X forced to #C0\n",GetCurrentFile(ae),ae->wl[ae->idx].l,ramconf);
+						if (ae->erronwarn) MaxError(ae);
+					}
 				}
 			}
 		}
@@ -10441,7 +10727,10 @@ void __RUN(struct s_assenv *ae) {
 		else MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"usage is RUN <adress>[,<ppi>]\n");
 	}
 	ae->snapshot.ramconfiguration=ramconf;
-	if (ae->rundefined && !ae->nowarning) rasm_printf(ae,KWARNING"[%s:%d] Warning: run adress redefinition\n",GetCurrentFile(ae),ae->wl[ae->idx].l);
+	if (ae->rundefined && !ae->nowarning) {
+		rasm_printf(ae,KWARNING"[%s:%d] Warning: run adress redefinition\n",GetCurrentFile(ae),ae->wl[ae->idx].l);
+		if (ae->erronwarn) MaxError(ae);
+	}
 	ae->rundefined=1;
 }
 void __BREAKPOINT(struct s_assenv *ae) {
@@ -10464,7 +10753,10 @@ void __SETCPC(struct s_assenv *ae) {
 	if (!ae->forcecpr) {
 		ae->forcesnapshot=1;
 	} else {
-		if (!ae->nowarning) rasm_printf(ae,KWARNING"[%s:%d] Warning: Cannot SETCPC when already in cartridge output\n",GetCurrentFile(ae),ae->wl[ae->idx].l);
+		if (!ae->nowarning) {
+			rasm_printf(ae,KWARNING"[%s:%d] Warning: Cannot SETCPC when already in cartridge output\n",GetCurrentFile(ae),ae->wl[ae->idx].l);
+			if (ae->erronwarn) MaxError(ae);
+		}
 	}
 
 	if (!ae->wl[ae->idx].t && ae->wl[ae->idx+1].t==1) {
@@ -10493,7 +10785,10 @@ void __SETCRTC(struct s_assenv *ae) {
 	if (!ae->forcecpr) {
 		ae->forcesnapshot=1;
 	} else {
-		if (!ae->nowarning) rasm_printf(ae,KWARNING"[%s:%d] Warning: Cannot SETCRTC when already in cartridge output\n",GetCurrentFile(ae),ae->wl[ae->idx].l);
+		if (!ae->nowarning) {
+			rasm_printf(ae,KWARNING"[%s:%d] Warning: Cannot SETCRTC when already in cartridge output\n",GetCurrentFile(ae),ae->wl[ae->idx].l);
+			if (ae->erronwarn) MaxError(ae);
+		}
 	}
 
 	if (!ae->wl[ae->idx].t && ae->wl[ae->idx+1].t==1) {
@@ -10767,6 +11062,12 @@ void __WHILE(struct s_assenv *ae) {
 				___internal_skip_loop_block(ae,E_LOOPSTYLE_WHILE);
 				return;
 		} else {
+
+			/*************************************************/
+			/********* PUSH Global on Stack ******************/
+			/*************************************************/
+			PushGlobal(ae);
+
 			ae->idx++;
 			whilewend.start=ae->idx;
 			whilewend.cpt=0;
@@ -10788,6 +11089,12 @@ void __WEND(struct s_assenv *ae) {
 		if (ae->wl[ae->idx].t==1) {
 			if (ComputeExpression(ae,ae->wl[ae->whilewend[ae->iw-1].start].w,ae->codeadr,0,2)) {
 				if (ae->whilewend[ae->iw-1].while_counter>65536) {
+
+					/*************************************************/
+					/********* POP Global on Stack *******************/
+					/*************************************************/
+					PopGlobal(ae);
+
 					MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"Bypass infinite WHILE loop\n");
 					ae->iw--;
 					/* refresh macro check index */
@@ -10800,6 +11107,12 @@ void __WEND(struct s_assenv *ae) {
 					ae->imacropos=ae->whilewend[ae->iw-1].maxim;
 				}
 			} else {
+
+				/*************************************************/
+				/********* POP Global on Stack *******************/
+				/*************************************************/
+				PopGlobal(ae);
+
 				ae->iw--;
 				/* refresh macro check index */
 				if (ae->iw) ae->imacropos=ae->whilewend[ae->iw-1].maxim;
@@ -10855,6 +11168,12 @@ void __REPEAT(struct s_assenv *ae) {
 			currepeat.start=ae->idx;
 			currepeat.cpt=-1;
 		}
+
+		/*************************************************/
+		/********* PUSH Global on Stack ******************/
+		/*************************************************/
+		PushGlobal(ae);
+
 		currepeat.value=ae->repeatcounter;
 		currepeat.repeat_counter=1;
 		ae->repeatcounter++;
@@ -10887,6 +11206,12 @@ void __REND(struct s_assenv *ae) {
 				ae->ir--;
 				/* refresh macro check index */
 				if (ae->ir) ae->imacropos=ae->repeat[ae->ir-1].maxim;
+
+				/*************************************************/
+				/********* POP Global on Stack *******************/
+				/*************************************************/
+				PopGlobal(ae);
+
 			}
 		}
 	} else {
@@ -10904,6 +11229,12 @@ void __UNTIL(struct s_assenv *ae) {
 				ExpressionFastTranslate(ae,&ae->wl[ae->idx+1].w,0);
 				if (!ComputeExpression(ae,ae->wl[ae->idx+1].w,ae->codeadr,0,2)) {
 					if (ae->repeat[ae->ir-1].repeat_counter>65536) {
+
+						/*************************************************/
+						/********* POP Global on Stack *******************/
+						/*************************************************/
+						PopGlobal(ae);
+
 						MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"Bypass infinite REPEAT loop\n");
 						ae->ir--;
 						/* refresh macro check index */
@@ -10915,6 +11246,12 @@ void __UNTIL(struct s_assenv *ae) {
 						ae->imacropos=ae->repeat[ae->ir-1].maxim;
 					}
 				} else {
+
+					/*************************************************/
+					/********* POP Global on Stack *******************/
+					/*************************************************/
+					PopGlobal(ae);
+
 					ae->ir--;
 					/* refresh macro check index */
 					if (ae->ir) ae->imacropos=ae->repeat[ae->ir-1].maxim;
@@ -11752,19 +12089,30 @@ void __ENDSTRUCT(struct s_assenv *ae) {
 			PushLabelLight(ae,&curlabel);
 			
 			/* compute size for each field */
+#if TRACE_STRUCT
+	printf("compute field size\n");
+#endif
 			newlen=strlen(ae->rasmstruct[ae->irasmstruct-1].name)+2;
-			for (i=0;i<ae->rasmstruct[ae->irasmstruct-1].irasmstructfield-1;i++) {
-				ae->rasmstruct[ae->irasmstruct-1].rasmstructfield[i].size=ae->rasmstruct[ae->irasmstruct-1].rasmstructfield[i+1].offset-ae->rasmstruct[ae->irasmstruct-1].rasmstructfield[i].offset;
+			if (ae->rasmstruct[ae->irasmstruct-1].irasmstructfield) {
+				for (i=0;i<ae->rasmstruct[ae->irasmstruct-1].irasmstructfield-1;i++) {
+					ae->rasmstruct[ae->irasmstruct-1].rasmstructfield[i].size=ae->rasmstruct[ae->irasmstruct-1].rasmstructfield[i+1].offset-ae->rasmstruct[ae->irasmstruct-1].rasmstructfield[i].offset;
+					ae->rasmstruct[ae->irasmstruct-1].rasmstructfield[i].fullname=MemMalloc(newlen+strlen(ae->rasmstruct[ae->irasmstruct-1].rasmstructfield[i].name));
+					sprintf(ae->rasmstruct[ae->irasmstruct-1].rasmstructfield[i].fullname,"%s.%s",ae->rasmstruct[ae->irasmstruct-1].name,ae->rasmstruct[ae->irasmstruct-1].rasmstructfield[i].name);
+					ae->rasmstruct[ae->irasmstruct-1].rasmstructfield[i].crc=GetCRC(ae->rasmstruct[ae->irasmstruct-1].rasmstructfield[i].fullname);
+				}
+				ae->rasmstruct[ae->irasmstruct-1].rasmstructfield[i].size=ae->rasmstruct[ae->irasmstruct-1].size-ae->rasmstruct[ae->irasmstruct-1].rasmstructfield[i].offset;
 				ae->rasmstruct[ae->irasmstruct-1].rasmstructfield[i].fullname=MemMalloc(newlen+strlen(ae->rasmstruct[ae->irasmstruct-1].rasmstructfield[i].name));
 				sprintf(ae->rasmstruct[ae->irasmstruct-1].rasmstructfield[i].fullname,"%s.%s",ae->rasmstruct[ae->irasmstruct-1].name,ae->rasmstruct[ae->irasmstruct-1].rasmstructfield[i].name);
 				ae->rasmstruct[ae->irasmstruct-1].rasmstructfield[i].crc=GetCRC(ae->rasmstruct[ae->irasmstruct-1].rasmstructfield[i].fullname);
+			} else {
+				rasm_printf(ae,KWARNING"[%s:%d] Warning: empty structure [%s]\n",GetCurrentFile(ae),ae->wl[ae->idx].l,curlabel.name);
+				if (ae->erronwarn) MaxError(ae);
 			}
-			ae->rasmstruct[ae->irasmstruct-1].rasmstructfield[i].size=ae->rasmstruct[ae->irasmstruct-1].size-ae->rasmstruct[ae->irasmstruct-1].rasmstructfield[i].offset;
-			ae->rasmstruct[ae->irasmstruct-1].rasmstructfield[i].fullname=MemMalloc(newlen+strlen(ae->rasmstruct[ae->irasmstruct-1].rasmstructfield[i].name));
-			sprintf(ae->rasmstruct[ae->irasmstruct-1].rasmstructfield[i].fullname,"%s.%s",ae->rasmstruct[ae->irasmstruct-1].name,ae->rasmstruct[ae->irasmstruct-1].rasmstructfield[i].name);
-			ae->rasmstruct[ae->irasmstruct-1].rasmstructfield[i].crc=GetCRC(ae->rasmstruct[ae->irasmstruct-1].rasmstructfield[i].fullname);
 
 			/* unwrap data capture */
+#if TRACE_STRUCT
+	printf("unwrap data capture\n");
+#endif
 			if (ae->as80==1) {/* not for UZ80 */
 				instruction[ICRC_DEFB].makemnemo=_DEFB_as80;instruction[ICRC_DB].makemnemo=_DEFB_as80;
 				instruction[ICRC_DEFW].makemnemo=_DEFW_as80;instruction[ICRC_DW].makemnemo=_DEFW_as80;
@@ -12103,6 +12451,9 @@ void __HEXBIN(struct s_assenv *ae) {
 	int deload=0;
 	int vtiles=0,remap=0,revert=0;
 	int itiles=0,tilex;
+	struct s_hexbin *curhexbin;
+	unsigned char *newdata=NULL;
+	int fileok=0,incwav=0;
 	
 	if (!ae->wl[ae->idx].t) {
 		ExpressionFastTranslate(ae,&ae->wl[ae->idx+1].w,1);
@@ -12118,29 +12469,12 @@ printf("Hexbin idx=[%s] filename=[%s]\n",ae->wl[ae->idx+1].w,ae->hexbin[hbinidx]
 		if (!ae->wl[ae->idx+1].t) {
 			if (strcmp("DSK",ae->wl[ae->idx+2].w)==0) {
 				/* import binary from DSK */
-			} else if (strchr("SD",ae->wl[ae->idx+2].w[0]) && ae->wl[ae->idx+2].w[1]=='M' &&
-					strchr("P24A",ae->wl[ae->idx+2].w[2]) && !ae->wl[ae->idx+2].w[3]) {
+			} else if (strchr("SD",ae->wl[ae->idx+2].w[0]) && ae->wl[ae->idx+2].w[1]=='M' && strchr("P24A",ae->wl[ae->idx+2].w[2]) && !ae->wl[ae->idx+2].w[3]) {
 				/* SMP,SM2,SM4,DMA */
-
 #if TRACE_HEXBIN
-printf("Hexbin -> %s\n",ae->wl[ae->idx+2].w);
+printf("Hexbin for WAV-> %s (no operation until delayed load)\n",ae->wl[ae->idx+2].w);
 #endif
-				if (!ae->wl[ae->idx+2].t) {
-					amplification=ComputeExpressionCore(ae,ae->wl[ae->idx+3].w,ae->codeadr,0);
-#if TRACE_HEXBIN
-printf("sample amplification=%.2lf\n",amplification);
-#endif
-				}
-
-				switch (ae->wl[ae->idx+2].w[2]) {
-					case 'P':_AudioLoadSample(ae,ae->hexbin[hbinidx].data,ae->hexbin[hbinidx].datalen, AUDIOSAMPLE_SMP,amplification);break;
-					case '2':_AudioLoadSample(ae,ae->hexbin[hbinidx].data,ae->hexbin[hbinidx].datalen, AUDIOSAMPLE_SM2,amplification);break;
-					case '4':_AudioLoadSample(ae,ae->hexbin[hbinidx].data,ae->hexbin[hbinidx].datalen, AUDIOSAMPLE_SM4,amplification);break;
-					case 'A':_AudioLoadSample(ae,ae->hexbin[hbinidx].data,ae->hexbin[hbinidx].datalen, AUDIOSAMPLE_DMA,amplification);break;
-					default:printf("warning remover\n");break;
-				}
-				ae->idx+=2;
-				return;
+				incwav=1;
 			} else {
 				/* legacy binary file */
 #if TRACE_HEXBIN
@@ -12272,10 +12606,8 @@ printf(" -> VTILES loading\n");
 
 		/* preprocessor cannot manage variables so here is the delayed load */
 		if (ae->hexbin[hbinidx].datalen<0) {
-			struct s_hexbin *curhexbin;
 			char *newfilename;
 			int lm,touched;
-			unsigned char *newdata=NULL;
 			
 #if TRACE_HEXBIN
 printf("Hexbin -> as only the assembler know how to deal with var,\n");
@@ -12291,8 +12623,26 @@ printf("we look for tags in the name of a file which were not found\n");
 			}
 			/* on essaie d'interpréter le nom du fichier en dynamique */
 			newfilename=TranslateTag(ae,newfilename,&touched,1,E_TAGOPTION_REMOVESPACE);
-			/* load */
-			if (FileExists(newfilename)) {
+
+			/* Where is the file to load? */
+			if (!FileExists(newfilename)) {
+				int ilookfile;
+				char *filename_toread;
+
+				/* on cherche dans les include */
+				for (ilookfile=0;ilookfile<ae->ipath && !fileok;ilookfile++) {
+					filename_toread=MergePath(ae,ae->includepath[ilookfile],newfilename);
+					if (FileExists(filename_toread)) {
+						fileok=1;
+						MemFree(newfilename);
+						newfilename=TxtStrDup(filename_toread); // Merge renvoie un static
+					}
+				}
+			} else {
+				fileok=1;
+			}
+
+			if (fileok) {
 #if TRACE_HEXBIN
 printf("Hexbin -> surprise! we found the file!\n");
 #endif
@@ -12327,8 +12677,21 @@ printf("Hexbin -> surprise! we found the file!\n");
 						}
 						break;
 					case 8:
-						rasm_printf(ae,KWARNING"Exomizer is crunching %.1fkb this may take a while, be patient...\n",curhexbin->datalen/1024.0);
+						if (curhexbin->datalen>=1024) rasm_printf(ae,KWARNING"Exomizer is crunching %.1fkb this may take a while, be patient...\n",curhexbin->datalen/1024.0);
 						newdata=Exomizer_crunch(curhexbin->data,curhexbin->datalen,&curhexbin->datalen);
+						MemFree(curhexbin->data);
+						curhexbin->data=newdata;
+						#if TRACE_PREPRO
+						rasm_printf(ae,KVERBOSE"crunched with Exomizer into %d byte(s)\n",curhexbin->datalen);
+						#endif
+						break;
+					case 17:
+						if (curhexbin->datalen>=1024) rasm_printf(ae,KWARNING"AP-Ultra is crunching %.1fkb this may take a while, be patient...\n",curhexbin->datalen/1024.0);
+						{
+						int nnewlen;
+						APULTRA_crunch(curhexbin->data,curhexbin->datalen,&newdata,&nnewlen);
+						curhexbin->datalen=nnewlen;
+						}
 						MemFree(curhexbin->data);
 						curhexbin->data=newdata;
 						#if TRACE_PREPRO
@@ -12361,9 +12724,33 @@ printf("Hexbin -> surprise! we found the file!\n");
 				return;
 			}
 		} 
+
+		if (incwav) {
+			/* SMP,SM2,SM4,DMA */
+#if TRACE_HEXBIN
+printf("Hexbin -> %s\n",ae->wl[ae->idx+2].w);
+#endif
+			if (!ae->wl[ae->idx+2].t) {
+				amplification=ComputeExpressionCore(ae,ae->wl[ae->idx+3].w,ae->codeadr,0);
+#if TRACE_HEXBIN
+printf("sample amplification=%.2lf\n",amplification);
+#endif
+			}
+
+			switch (ae->wl[ae->idx+2].w[2]) {
+				case 'P':_AudioLoadSample(ae,ae->hexbin[hbinidx].data,ae->hexbin[hbinidx].datalen, AUDIOSAMPLE_SMP,amplification);break;
+				case '2':_AudioLoadSample(ae,ae->hexbin[hbinidx].data,ae->hexbin[hbinidx].datalen, AUDIOSAMPLE_SM2,amplification);break;
+				case '4':_AudioLoadSample(ae,ae->hexbin[hbinidx].data,ae->hexbin[hbinidx].datalen, AUDIOSAMPLE_SM4,amplification);break;
+				case 'A':_AudioLoadSample(ae,ae->hexbin[hbinidx].data,ae->hexbin[hbinidx].datalen, AUDIOSAMPLE_DMA,amplification);break;
+				default:printf("warning remover\n");break;
+			}
+			ae->idx+=2;
+			return;
+		}
 		
 		if (ae->hexbin[hbinidx].datalen>0) {
 			if (hbinidx<ae->ih && hbinidx>=0) {
+				/* pre-parametres OK (longueur+IDX struct) */
 				if (size<0) {
 #if TRACE_HEXBIN
 printf("taille négative %d -> conversion en %d\n",size,ae->hexbin[hbinidx].datalen+size);
@@ -12396,11 +12783,19 @@ printf("taille nulle et offset=%d -> conversion en %d\n",offset,size);
 					if (size+offset>ae->hexbin[hbinidx].datalen) {
 						MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"INCBIN size+offset is greater than filesize\n");
 					} else {
+						/* OUTPUT DATA */
+						unsigned char *outputdata;
+						int outputidx=0;
+						outputdata=MemMalloc(ae->hexbin[hbinidx].datalen);
+#if TRACE_HEXBIN
+printf("output fictif pour réorganiser les données\n");
+#endif
+
 						if (revert) {
 							int p;
 							p=size-1;
 							while (p>=0) {
-								___output(ae,ae->hexbin[hbinidx].data[p--]);
+								outputdata[outputidx++]=ae->hexbin[hbinidx].data[p--];
 							}
 						} else if (itiles) {
 							/* tiles data reordering */
@@ -12411,14 +12806,14 @@ printf("taille nulle et offset=%d -> conversion en %d\n",offset,size);
 							} else {
 								it=0;
 								while (it<size) {
-									for (tx=0;tx<tilex;tx++)    ___output(ae,ae->hexbin[hbinidx].data[it+tx+0*tilex]);
-									for (tx=tilex-1;tx>=0;tx--) ___output(ae,ae->hexbin[hbinidx].data[it+tx+1*tilex]);
-									for (tx=0;tx<tilex;tx++)    ___output(ae,ae->hexbin[hbinidx].data[it+tx+3*tilex]);
-									for (tx=tilex-1;tx>=0;tx--) ___output(ae,ae->hexbin[hbinidx].data[it+tx+2*tilex]);
-									for (tx=0;tx<tilex;tx++)    ___output(ae,ae->hexbin[hbinidx].data[it+tx+6*tilex]);
-									for (tx=tilex-1;tx>=0;tx--) ___output(ae,ae->hexbin[hbinidx].data[it+tx+7*tilex]);
-									for (tx=0;tx<tilex;tx++)    ___output(ae,ae->hexbin[hbinidx].data[it+tx+5*tilex]);
-									for (tx=tilex-1;tx>=0;tx--) ___output(ae,ae->hexbin[hbinidx].data[it+tx+4*tilex]);
+									for (tx=0;tx<tilex;tx++)    outputdata[outputidx++]=ae->hexbin[hbinidx].data[it+tx+0*tilex];
+									for (tx=tilex-1;tx>=0;tx--) outputdata[outputidx++]=ae->hexbin[hbinidx].data[it+tx+1*tilex];
+									for (tx=0;tx<tilex;tx++)    outputdata[outputidx++]=ae->hexbin[hbinidx].data[it+tx+3*tilex];
+									for (tx=tilex-1;tx>=0;tx--) outputdata[outputidx++]=ae->hexbin[hbinidx].data[it+tx+2*tilex];
+									for (tx=0;tx<tilex;tx++)    outputdata[outputidx++]=ae->hexbin[hbinidx].data[it+tx+6*tilex];
+									for (tx=tilex-1;tx>=0;tx--) outputdata[outputidx++]=ae->hexbin[hbinidx].data[it+tx+7*tilex];
+									for (tx=0;tx<tilex;tx++)    outputdata[outputidx++]=ae->hexbin[hbinidx].data[it+tx+5*tilex];
+									for (tx=tilex-1;tx>=0;tx--) outputdata[outputidx++]=ae->hexbin[hbinidx].data[it+tx+4*tilex];
 									it+=tilex*8;
 								}
 							}
@@ -12433,7 +12828,7 @@ printf("taille nulle et offset=%d -> conversion en %d\n",offset,size);
 							} else {
 								for (it=0;it<remap;it++) {
 									for (tx=0;tx<width;tx++) {
-										___output(ae,ae->hexbin[hbinidx].data[it+tx*remap]);
+										outputdata[outputidx++]=ae->hexbin[hbinidx].data[it+tx*remap];
 									}
 								}
 							}
@@ -12451,7 +12846,7 @@ printf("taille nulle et offset=%d -> conversion en %d\n",offset,size);
 printf("Hexbin -> re-tiling MAP! width=%d\n",width);
 #endif
 								for (idx=tilex=tiley=0;idx<size;idx++) {
-									___output(ae,ae->hexbin[hbinidx].data[tilex+tiley*width]);
+									outputdata[outputidx++]=ae->hexbin[hbinidx].data[tilex+tiley*width];
 									tiley++;
 									if (tiley>=vtiles) {
 										tiley=0;
@@ -12461,22 +12856,98 @@ printf("Hexbin -> re-tiling MAP! width=%d\n",width);
 							}
 						} else {
 							/* legacy HEXBIN */
-							if (overwritecheck) {
-								for (idx=offset;idx<size+offset;idx++) {
-									___output(ae,ae->hexbin[hbinidx].data[idx]);
-								}
-							} else {
-								___org_close(ae);
-								___org_new(ae,0);
-								for (idx=offset;idx<size+offset;idx++) {
-									___output(ae,ae->hexbin[hbinidx].data[idx]);
-								}
-								/* hack to disable overwrite check */
-								ae->orgzone[ae->io-1].nocode=2;
-								___org_close(ae);
-								___org_new(ae,0);
+							for (idx=offset;idx<size+offset;idx++) {
+								outputdata[outputidx++]=ae->hexbin[hbinidx].data[idx];
+							}
+
+							if (!overwritecheck) {
+								rasm_printf(ae,KWARNING"INCBIN without overwrite check still not working...\n");
+								if (ae->erronwarn) MaxError(ae);
 							}
 						}
+
+						switch (curhexbin->crunch) {
+							#ifndef NO_3RD_PARTIES
+							case 4:
+								newdata=LZ4_crunch(outputdata,outputidx,&curhexbin->datalen);
+								MemFree(curhexbin->data);
+								curhexbin->data=newdata;
+								#if TRACE_PREPRO
+								rasm_printf(ae,KVERBOSE"crunched with LZ4 into %d byte(s)\n",curhexbin->datalen);
+								#endif
+								break;
+							case 7:
+								{
+								size_t slzlen;
+								newdata=ZX7_compress(optimize(outputdata, outputidx), outputdata, outputidx, &slzlen);
+								curhexbin->datalen=slzlen;
+								MemFree(curhexbin->data);
+								curhexbin->data=newdata;
+								#if TRACE_PREPRO
+								rasm_printf(ae,KVERBOSE"crunched with ZX7 into %d byte(s)\n",curhexbin->datalen);
+								#endif
+								}
+								break;
+							case 8:
+								if (curhexbin->datalen>=1024) rasm_printf(ae,KWARNING"Exomizer is crunching %.1fkb this may take a while, be patient...\n",curhexbin->datalen/1024.0);
+								newdata=Exomizer_crunch(outputdata,outputidx,&curhexbin->datalen);
+								MemFree(curhexbin->data);
+								curhexbin->data=newdata;
+								#if TRACE_PREPRO
+								rasm_printf(ae,KVERBOSE"crunched with Exomizer into %d byte(s)\n",curhexbin->datalen);
+								#endif
+								break;
+							case 17:
+								if (curhexbin->datalen>=1024) rasm_printf(ae,KWARNING"AP-Ultra is crunching %.1fkb this may take a while, be patient...\n",curhexbin->datalen/1024.0);
+								{
+								int nnewlen;
+								APULTRA_crunch(outputdata,outputidx,&newdata,&nnewlen);
+								curhexbin->datalen=nnewlen;
+								}
+								MemFree(curhexbin->data);
+								curhexbin->data=newdata;
+								#if TRACE_PREPRO
+								rasm_printf(ae,KVERBOSE"crunched with Exomizer into %d byte(s)\n",curhexbin->datalen);
+								#endif
+								break;
+							#endif
+							case 48:
+								newdata=LZ48_crunch(outputdata,outputidx,&curhexbin->datalen);
+								MemFree(curhexbin->data);
+								curhexbin->data=newdata;
+								#if TRACE_PREPRO
+								rasm_printf(ae,KVERBOSE"crunched with LZ48 into %d byte(s)\n",curhexbin->datalen);
+								#endif
+								break;
+							case 49:
+								newdata=LZ49_crunch(outputdata,outputidx,&curhexbin->datalen);
+								MemFree(curhexbin->data);
+								curhexbin->data=newdata;
+								#if TRACE_PREPRO
+								rasm_printf(ae,KVERBOSE"crunched with LZ49 into %d byte(s)\n",curhexbin->datalen);
+								#endif
+								break;
+							default:break;
+						}
+
+
+						if (overwritecheck) {
+							for (idx=0;idx<outputidx;idx++) {
+								___output(ae,outputdata[idx]);
+							}
+						} else {
+							___org_close(ae);
+							___org_new(ae,0);
+							/* hack to disable overwrite check */
+							for (idx=0;idx<outputidx;idx++) {
+								___output(ae,outputdata[idx]);
+							}
+							ae->orgzone[ae->io-1].nocode=2;
+							___org_close(ae);
+							___org_new(ae,0);
+						}
+
+						MemFree(outputdata);
 					}
 				}
 			} else {
@@ -12584,22 +13055,22 @@ void __SAVE(struct s_assenv *ae) {
 
 void __MODULE(struct s_assenv *ae) {
 	if (!ae->wl[ae->idx].t && ae->wl[ae->idx+1].t==1) {
-		if (StringIsQuote(ae->wl[ae->idx+1].w)) {
+		if (strcmp(ae->wl[ae->idx+1].w,"OFF")==0) {
+			if (ae->module || ae->modulen) MemFree(ae->module);
+			ae->module=NULL;
+			ae->modulen=0;
+		} else {
 			if (ae->modulen || ae->module) {
 				MemFree(ae->module);
 			}
 			ae->modulen=strlen(ae->wl[ae->idx+1].w);
-			ae->module=MemMalloc(ae->modulen);
-			/* duplicate and remove quotes */
-			strcpy(ae->module,ae->wl[ae->idx+1].w+1);
-			ae->module[--ae->modulen]=0;
-		} else {
-			MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"MODULE directive need one text parameter\n");
+			ae->module=TxtStrDup(ae->wl[ae->idx+1].w);
 		}
 		ae->idx++;
 	} else {
-		if (ae->module) MemFree(ae->module);
+		if (ae->module || ae->modulen) MemFree(ae->module);
 		ae->module=NULL;
+		ae->modulen=0;
 	}
 }
 
@@ -12740,6 +13211,7 @@ struct s_asm_keyword instruction[]={
 {"LIMIT",0,__LIMIT},
 {"LZEXO",0,__LZEXO},
 {"LZX7",0,__LZX7},
+{"LZAPU",0,__LZAPU},
 {"LZ4",0,__LZ4},
 {"LZ48",0,__LZ48},
 {"LZ49",0,__LZ49},
@@ -12761,6 +13233,7 @@ struct s_asm_keyword instruction[]={
 {"ENDS",0,__ENDSTRUCT},
 {"NOEXPORT",0,__NOEXPORT},
 {"ENOEXPORT",0,__ENOEXPORT},
+{"MODULE",0,__MODULE},
 {"",0,NULL}
 };
 
@@ -12789,6 +13262,8 @@ int Assemble(struct s_assenv *ae, unsigned char **dataout, int *lenout, struct s
 	/* debug */
 	int curii,inhibe;
 	int ok;
+	/* macro inception */
+	int imacrocur=0;
 
 	rasm_printf(ae,KAYGREEN"Assembling\n");
 #if TRACE_ASSEMBLE
@@ -13099,22 +13574,44 @@ printf("-loop\n");
 				}				
 			}
 		}
+		/*****************************************
+		  m a c r o   p o s i t i o n s
+		*****************************************/
 		if (ae->imacropos) {
+			int icheckm,inewmacrocur;
+			int curlevel;
+
+			/*
+			printf("===== Macro positions idx=%d =====\n",ae->idx);
+			for (icheckm=0;icheckm<ae->imacropos;icheckm++) {
+				printf("macro[%d] start=%3d end=%3d level=%d \n",icheckm,ae->macropos[icheckm].start,ae->macropos[icheckm].end,ae->macropos[icheckm].level);
+			}
+			printf("---------------------------\n");
+			*/
+
+			/* we must close */
+			for (icheckm=0;icheckm<ae->imacropos;icheckm++) {
+				if (ae->idx==ae->macropos[icheckm].end) {
+					/* contiguous macro management... */
+					if (ae->macropos[icheckm].pushed) {
+						PopGlobal(ae);
+						ae->macropos[icheckm].pushed=0;
+					}
+				}
+			}
+			/* before opening */
+			for (icheckm=0;icheckm<ae->imacropos;icheckm++) {
+				if (ae->idx==ae->macropos[icheckm].start) {
+					PushGlobal(ae);
+					ae->macropos[icheckm].pushed=1;
+				}
+			}
+
 			/* are we still in a macro? */
 			if (ae->idx>=ae->macropos[0].end) {
 				/* are we out of all repetition blocks? */
 				if (!ae->ir && !ae->iw) {
 					ae->imacropos=0;
-
-					/* quand on sort du local, on récupère le dernier label global */
-					if (ae->lastsuperglobal!=ae->lastgloballabel && ae->lastsuperglobal) {
-						if (ae->lastglobalalloc) {
-							MemFree(ae->lastgloballabel);
-							ae->lastglobalalloc=0;
-						}
-						ae->lastgloballabel=ae->lastsuperglobal;
-						ae->lastgloballabellen=strlen(ae->lastgloballabel);
-					}
 				}
 			}
 		}
@@ -13246,6 +13743,7 @@ printf("crunch if any\n");
 //printf("grouik (%d) %s\n",ae->lzsection[i].lzversion,ae->lzsection[i].lzversion==8?"mizou":"");
 			if (!input_size) {
 				rasm_printf(ae,KWARNING"[%s:%d] Warning: crunched section is empty\n",GetCurrentFile(ae),ae->wl[ae->idx].l);
+				if (ae->erronwarn) MaxError(ae);
 			} else {
 				switch (ae->lzsection[i].lzversion) {
 					case 7:
@@ -13261,9 +13759,14 @@ printf("crunch if any\n");
 						break;
 					case 8:
 						#ifndef NO_3RD_PARTIES
-						rasm_printf(ae,KWARNING"Exomizer is crunching %.1fkb this may take a while, be patient...\n",input_size/1024.0);
-
+						if (input_size>=1024) rasm_printf(ae,KWARNING"Exomizer is crunching %.1fkb this may take a while, be patient...\n",input_size/1024.0);
 						lzdata=Exomizer_crunch(input_data,input_size,&lzlen);
+						#endif
+						break;
+					case 17:
+						#ifndef NO_3RD_PARTIES
+						if (input_size>=1024) rasm_printf(ae,KWARNING"AP-Ultra is crunching %.1fkb this may take a while, be patient...\n",input_size/1024.0);
+						APULTRA_crunch(input_data,input_size,&lzdata,&lzlen);
 						#endif
 						break;
 					case 48:
@@ -13493,7 +13996,10 @@ printf("output files\n");
 					int noflood=0;
 
 					if (ae->snapshot.version==2 && ae->snapshot.CPCType>2) {
-						if (!ae->nowarning) rasm_printf(ae,KWARNING"[%s:%d] Warning: V2 snapshot cannot select a Plus model (forced to 6128)\n",GetCurrentFile(ae),ae->wl[ae->idx].l);
+						if (!ae->nowarning) {
+							rasm_printf(ae,KWARNING"[%s:%d] Warning: V2 snapshot cannot select a Plus model (forced to 6128)\n",GetCurrentFile(ae),ae->wl[ae->idx].l);
+							if (ae->erronwarn) MaxError(ae);
+						}
 						ae->snapshot.CPCType=2; /* 6128 */
 					}
 					
@@ -13522,6 +14028,7 @@ printf("output files\n");
 					}
 					if (maxrom==-1) {
 						rasm_printf(ae,KWARNING"Warning: No byte were written in snapshot memory\n");
+						if (ae->erronwarn) MaxError(ae);
 					} else {
 						rasm_printf(ae,KIO"Write snapshot v%d file %s\n",ae->snapshot.version,TMP_filename);
 						
@@ -13640,6 +14147,11 @@ printf("output files\n");
 								/* add labels and local labels to breakpoint pool (if any) */
 								for (i=0;i<ae->il;i++) {
 									if (!ae->label[i].name) {
+										if (strstr(ae->wl[ae->label[i].iw].w,".BRK")!=NULL) {
+											breakpoint.address=ae->label[i].ptr;
+											if (ae->label[i].ibank>3) breakpoint.bank=1; else breakpoint.bank=0;
+											ObjectArrayAddDynamicValueConcat((void **)&ae->breakpoint,&ae->ibreakpoint,&ae->maxbreakpoint,&breakpoint,sizeof(struct s_breakpoint));
+										}
 										if (strncmp(ae->wl[ae->label[i].iw].w,"BRK",3)==0) {
 											breakpoint.address=ae->label[i].ptr;
 											if (ae->label[i].ibank>3) breakpoint.bank=1; else breakpoint.bank=0;
@@ -13782,10 +14294,16 @@ printf("output files\n");
 							}
 						} else {
 							if (ae->export_snabrk) {
-								if (!ae->nowarning) rasm_printf(ae,KWARNING"Warning: breakpoint export is not supported with snapshot version 2\n");
+								if (!ae->nowarning) {
+									rasm_printf(ae,KWARNING"Warning: breakpoint export is not supported with snapshot version 2\n");
+									if (ae->erronwarn) MaxError(ae);
+								}
 							}
 							if (ae->export_sna) {
-								if (!ae->nowarning) rasm_printf(ae,KWARNING"Warning: symbol export is not supported with snapshot version 2\n");
+								if (!ae->nowarning) {
+									rasm_printf(ae,KWARNING"Warning: symbol export is not supported with snapshot version 2\n");
+									if (ae->erronwarn) MaxError(ae);
+								}
 							}
 						}
 
@@ -13828,7 +14346,10 @@ printf("output files\n");
 				}
 				if (maxmem-minmem<=0) {
 					if (!ae->stop) {
-						if (!ae->nowarning) rasm_printf(ae,KWARNING"Warning: Not a single byte to output\n");
+						if (!ae->nowarning) {
+							rasm_printf(ae,KWARNING"Warning: Not a single byte to output\n");
+							if (ae->erronwarn) MaxError(ae);
+						}
 					}
 					if (ae->flux) {
 						*lenout=0;
@@ -13866,6 +14387,7 @@ printf("output files\n");
 				if (strcmp(ae->alias[i].alias,"IX") && strcmp(ae->alias[i].alias,"IY")) {
 					if (!ae->alias[i].used) {
 						rasm_printf(ae,KWARNING"[%s:%d] Warning: alias %s declared but not used\n",ae->filename[ae->wl[ae->alias[i].iw].ifile],ae->wl[ae->alias[i].iw].l,ae->alias[i].alias);
+						if (ae->erronwarn) MaxError(ae);
 					}
 				}
 			}
@@ -14135,7 +14657,10 @@ printf("output files\n");
 				}
 				FileWriteLineClose(TMP_filename);
 			} else {
-				if (!ae->nowarning) rasm_printf(ae,KWARNING"Warning: no breakpoint to output (previous file [%s] deleted anyway)\n",TMP_filename);
+				if (!ae->nowarning) {
+					rasm_printf(ae,KWARNING"Warning: no breakpoint to output (previous file [%s] deleted anyway)\n",TMP_filename);
+					if (ae->erronwarn) MaxError(ae);
+				}
 			}
 		}
 
@@ -14175,7 +14700,8 @@ printf("dependencies\n");
 /*******************************************************************************************
                            V E R B O S E     S H I T
 *******************************************************************************************/
-#if TRACE_ASSEMBLE
+	if (ae->display_stats) {
+		int parsed_size=0;
 		rasm_printf(ae,KVERBOSE"------ statistics ------------------\n");
 		rasm_printf(ae,KVERBOSE"%d file%s\n",ae->ifile,ae->ifile>1?"s":"");
 		rasm_printf(ae,KVERBOSE"%d binary include%s\n",ae->ih,ae->ih>1?"s":"");
@@ -14188,8 +14714,10 @@ printf("dependencies\n");
 		rasm_printf(ae,KVERBOSE"%d alias%s\n",ae->ialias,ae->ialias>1?"s":"");
 		rasm_printf(ae,KVERBOSE"%d ORG zone%s\n",ae->io-1,ae->io>2?"s":"");
 		rasm_printf(ae,KVERBOSE"%d virtual space%s\n",ae->nbbank,ae->nbbank>1?"s":"");
-#endif
-
+		rasm_printf(ae,KVERBOSE"\n");
+		for (i=0;i<ae->nbword;i++) parsed_size+=strlen(ae->wl[i].w);
+		rasm_printf(ae,KVERBOSE"%d byte%s of pure code\n",parsed_size,parsed_size>1?"s":"");
+	}
 /*******************************************************************************************
                                   C L E A N U P
 *******************************************************************************************/
@@ -14223,7 +14751,7 @@ printf("-end ok=%d\n",ok);
 
 
 void EarlyPrepSrc(struct s_assenv *ae, char **listing, char *filename) {
-	int l,idx,c,quote_type=0;
+	int l,idx,c,quote_type=0,further;
 	int mlc_start,mlc_idx;
 
 	/* virer les commentaires en ;, // mais aussi multi-lignes et convertir les decalages, passer les chars en upper case */
@@ -14235,70 +14763,91 @@ void EarlyPrepSrc(struct s_assenv *ae, char **listing, char *filename) {
 			l++;
 			idx=0;
 			continue;
-		} else if (!quote_type) {
-			/* upper case */
-			if (c>='a' && c<='z') {
-				listing[l][idx-1]=c=c-'a'+'A';
-			}
+		} else {
+			if (!quote_type) {
 
-			if (c=='\'' && idx>2 && strncmp(&listing[l][idx-3],"AF'",3)==0) {
-				/* il ne faut rien faire */
-			} else if (c=='"' || c=='\'') {
-				quote_type=c;
-			} else if (c==';' || (c=='/' && listing[l][idx]=='/')) {
-				idx--;
-				while (listing[l][idx] && listing[l][idx]!=0x0D && listing[l][idx]!=0x0A) listing[l][idx++]=':';
-				idx--;
-			} else if (c=='>' && listing[l][idx]=='>' && !quote_type) {
-				listing[l][idx-1]=']';
-				listing[l][idx++]=' ';
-				continue;
-			} else if (c=='<' && listing[l][idx]=='<' && !quote_type) {
-				listing[l][idx-1]='[';
-				listing[l][idx++]=' ';
-				continue;
-			} else if (c=='/' && listing[l][idx]=='*' && !quote_type) {
-				/* multi-line comment */
-				mlc_start=l;
-				mlc_idx=idx-1;
-				idx++;
-				while (1) {
-					c=listing[l][idx++];
-					if (!c) {
-						idx=0;
-						l++;
-						if (!listing[l]) {
-							MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"opened comment to the end of the file\n",filename,l+1);
-							return;
+				/* upper case */
+				if (c>='a' && c<='z') {
+					listing[l][idx-1]=c=c-'a'+'A';
+				}
+
+				if (c=='\'' && idx>2 && strncmp(&listing[l][idx-3],"AF'",3)==0) {
+					/* il ne faut rien faire */
+				} else if (c=='"' || c=='\'') {
+					quote_type=c;
+				} else if (c==';' || (c=='/' && listing[l][idx]=='/')) {
+					idx--;
+					while (listing[l][idx] && listing[l][idx]!=0x0D && listing[l][idx]!=0x0A) listing[l][idx++]=':';
+					idx--;
+				} else if (c=='>' && listing[l][idx]=='>' && !quote_type) {
+					listing[l][idx-1]=']';
+					listing[l][idx++]=' ';
+					continue;
+				} else if (c=='<' && listing[l][idx]=='<' && !quote_type) {
+					listing[l][idx-1]='[';
+					listing[l][idx++]=' ';
+					continue;
+				} else if (c=='/' && listing[l][idx]=='*' && !quote_type) {
+					/* multi-line comment */
+					mlc_start=l;
+					mlc_idx=idx-1;
+					idx++;
+					while (1) {
+						c=listing[l][idx++];
+						if (!c) {
+							idx=0;
+							l++;
+							if (!listing[l]) {
+								MakeError(ae,filename,l+1,"opened comment to the end of the file\n");
+								return;
+							}
+						} else if (c=='*' && listing[l][idx]=='/') {
+							idx++;
+							break;
 						}
-					} else if (c=='*' && listing[l][idx]=='/') {
-						idx++;
-						break;
+					}
+					/* merge */
+					if (mlc_start==l) {
+						/* on the same line */
+						while (mlc_idx<idx) listing[l][mlc_idx++]=' '; /* raz with spaces */
+					} else {
+						/* multi-line */
+						listing[mlc_start][mlc_idx]=0; /* raz EOL */
+						mlc_start++;
+						while (mlc_start<l) listing[mlc_start++][0]=0; /* raz line */
+						mlc_idx=0;
+						while (mlc_idx<idx) listing[l][mlc_idx++]=' '; /* raz beginning of the line */
 					}
 				}
-				/* merge */
-				if (mlc_start==l) {
-					/* on the same line */
-					while (mlc_idx<idx) listing[l][mlc_idx++]=' '; /* raz with spaces */
-				} else {
-					/* multi-line */
-					listing[mlc_start][mlc_idx]=0; /* raz EOL */
-					mlc_start++;
-					while (mlc_start<l) listing[mlc_start++][0]=0; /* raz line */
-					mlc_idx=0;
-					while (mlc_idx<idx) listing[l][mlc_idx++]=' '; /* raz beginning of the line */
+			} else {
+				/* in quote */
+				if (c=='\\') {
+					if (listing[l][idx]) {
+						idx++;
+					}
+				} else if (c==quote_type) {
+					quote_type=0;
 				}
-			}
-		} else {
-			/* in quote */
-			if (c=='\\') {
-				if (listing[l][idx]) {
-					idx++;
-				}
-			} else if (c==quote_type) {
-				quote_type=0;
 			}
 		}
+	}
+	l-=2;
+	if (l>0)
+	while (l>=0) {
+		/* patch merge line with '\' only outside quotes */
+		idx=strlen(listing[l])-1;
+
+		while (idx && (listing[l][idx]==' ' || listing[l][idx]==0x0D || listing[l][idx]==0x0A || listing[l][idx]==0x0B)) {
+			idx--;
+		}
+
+		if (listing[l][idx]=='\\') {
+			/* fusion avec la ligne suivante qui est obligatoirement présente */
+			listing[l]=MemRealloc(listing[l],strlen(listing[l])+strlen(listing[l+1])+1);
+			strcpy(listing[l]+idx,listing[l+1]);
+			strcpy(listing[l+1],"");
+		}
+		l--;
 	}
 }
 
@@ -14410,6 +14959,8 @@ struct s_assenv *PreProcessing(char *filename, int flux, const char *datain, int
 	int nbinstruction;
 	int ifast,texpr;
 	int ispace=0;
+	char opassign=0;
+
 
 #if TRACE_GENERALE
 printf("*** preprocessing ***\n");
@@ -14448,6 +14999,7 @@ printf("paramz 1\n");
 		}
 		ae->export_brk=param->export_brk;
 		ae->warn_unused=param->warn_unused;
+		ae->display_stats=param->display_stats;
 		ae->edskoverwrite=param->edskoverwrite;
 		ae->rough=param->rough;
 		ae->as80=param->as80;
@@ -14462,6 +15014,7 @@ printf("paramz 1\n");
 		ae->maxerr=param->maxerr;
 		ae->extended_error=param->extended_error;
 		ae->nowarning=param->nowarning;
+		ae->erronwarn=param->erronwarn;
 		ae->breakpoint_name=param->breakpoint_name;
 		ae->symbol_name=param->symbol_name;
 		ae->binary_name=param->binary_name;
@@ -14655,11 +15208,11 @@ printf("nbbank=%d initialised\n",ae->nbbank);
 	/* si on est en ligne de commande ET que le fichier n'est pas trouvé */
 	if (param && param->filename && !FileExists(param->filename)) {
 		char *LTryExtension[]={".asm",".z80",".o",".dam",".mxm",".txt",
-					".ASM",".Z80",".O",".DAM",".MXM",".TXT",NULL};
+					".ASM",".Z80",".O",".DAM",".MXM",".TXT","",NULL};
 
 		int iguess=1;
 		l=strlen(param->filename);
-		filename=MemRealloc(param->filename,l+6);
+		param->filename=MemRealloc(param->filename,l+6);
 		/* si le nom du fichier termine par un . on n'ajoute que l'extension, sinon on l'ajoute avec le . */
 		if (param->filename[l-1]=='.') strcat(param->filename,"asm"); else strcat(param->filename,".asm");
 
@@ -14833,86 +15386,14 @@ printf("-comz/include\n");
 							}
 						}
 					}
-					
 					curhexbin.filename=TxtStrDup(filename_toread);
 					curhexbin.crunch=crunch;
-					if (fileok) {
-						/* lecture */
-						curhexbin.rawlen=curhexbin.datalen=FileGetSize(filename_toread);
-						curhexbin.data=MemMalloc(curhexbin.datalen*1.3+10);
-						#if TRACE_PREPRO
-							switch (crunch) {
-								case 0:rasm_printf(ae,KBLUE"incbin [%s] size=%d\n",filename_toread,curhexbin.datalen);break;
-								case 4:rasm_printf(ae,KBLUE"inclz4 [%s] size=%d\n",filename_toread,curhexbin.datalen);break;
-								case 7:rasm_printf(ae,KBLUE"incsx7 [%s] size=%d\n",filename_toread,curhexbin.datalen);break;
-								case 8:rasm_printf(ae,KBLUE"incexo [%s] size=%d\n",filename_toread,curhexbin.datalen);break;
-								case 88:rasm_printf(ae,KBLUE"incexb [%s] size=%d\n",filename_toread,curhexbin.datalen);break;
-								case 48:rasm_printf(ae,KBLUE"incl48 [%s] size=%d\n",filename_toread,curhexbin.datalen);break;
-								case 49:rasm_printf(ae,KBLUE"incl49 [%s] size=%d\n",filename_toread,curhexbin.datalen);break;
-								default:rasm_printf(ae,KBLUE"invalid crunch state!\n");exit(-42);
-							}
-						#endif
-						if (FileReadBinary(filename_toread,(char*)curhexbin.data,curhexbin.datalen)!=curhexbin.datalen) {
-							rasm_printf(ae,"read error on %s",filename_toread);
-							exit(2);
-						}
-						FileReadBinaryClose(filename_toread);
-						switch (crunch) {
-							#ifndef NO_3RD_PARTIES
-							case 4:
-								newdata=LZ4_crunch(curhexbin.data,curhexbin.datalen,&curhexbin.datalen);
-								MemFree(curhexbin.data);
-								curhexbin.data=newdata;
-								#if TRACE_PREPRO
-								rasm_printf(ae,KVERBOSE"crunched with LZ4 into %d byte(s)\n",curhexbin.datalen);
-								#endif
-								break;
-							case 7:
-								{
-								size_t slzlen;
-								newdata=ZX7_compress(optimize(curhexbin.data, curhexbin.datalen), curhexbin.data, curhexbin.datalen, &slzlen);
-								curhexbin.datalen=slzlen;
-								MemFree(curhexbin.data);
-								curhexbin.data=newdata;
-								#if TRACE_PREPRO
-								rasm_printf(ae,KVERBOSE"crunched with ZX7 into %d byte(s)\n",curhexbin.datalen);
-								#endif
-								}
-								break;
-							case 8:
-						rasm_printf(ae,KWARNING"Exomizer is crunching %.1fkb this may take a while, be patient...\n",curhexbin.datalen/1024.0);
-								newdata=Exomizer_crunch(curhexbin.data,curhexbin.datalen,&curhexbin.datalen);
-								MemFree(curhexbin.data);
-								curhexbin.data=newdata;
-								#if TRACE_PREPRO
-								rasm_printf(ae,KVERBOSE"crunched with Exomizer into %d byte(s)\n",curhexbin.datalen);
-								#endif
-								break;
-							#endif
-							case 48:
-								newdata=LZ48_crunch(curhexbin.data,curhexbin.datalen,&curhexbin.datalen);
-								MemFree(curhexbin.data);
-								curhexbin.data=newdata;
-								#if TRACE_PREPRO
-								rasm_printf(ae,KVERBOSE"crunched with LZ48 into %d byte(s)\n",curhexbin.datalen);
-								#endif
-								break;
-							case 49:
-								newdata=LZ49_crunch(curhexbin.data,curhexbin.datalen,&curhexbin.datalen);
-								MemFree(curhexbin.data);
-								curhexbin.data=newdata;
-								#if TRACE_PREPRO
-								rasm_printf(ae,KVERBOSE"crunched into with LZ49 %d byte(s)\n",curhexbin.datalen);
-								#endif
-								break;
-							default:break;
-						}
-					} else {
-						/* TAG + info */
-						curhexbin.datalen=-1;
-						curhexbin.data=MemMalloc(2);
-						/* not yet an error, we will know later when executing the code */
-					}
+
+					/* TAG + info */
+					curhexbin.datalen=-1;
+					curhexbin.data=MemMalloc(2);
+					/* not yet an error, we will know later when executing the code */
+
 					ObjectArrayAddDynamicValueConcat((void**)&ae->hexbin,&ae->ih,&ae->mh,&curhexbin,sizeof(curhexbin));
 					/* insertion */
 					le=strlen(listing[l].listing);
@@ -15005,6 +15486,15 @@ printf("-comz/include\n");
 					include=1;
 					waiting_quote=1;
 					rewrite=idx-4-1;
+					/* quote right after keyword */
+					if (c==quote_type) {
+						waiting_quote=2;
+					}
+				} else if (strcmp(bval,"INCAPU")==0) {
+					incbin=1;
+					crunch=17;
+					waiting_quote=1;
+					rewrite=idx-6-1;
 					/* quote right after keyword */
 					if (c==quote_type) {
 						waiting_quote=2;
@@ -15477,6 +15967,22 @@ printf("expr operator=%c\n",c);
 #endif
 					/* expression/condition */
 					texpr=1;
+
+					/* patch operator assignment with useless spacing v121 */
+					if (lw==1 && c=='=') {
+						switch (w[0]) {
+							case '[':case ']':case '+':case '*':case '-':case '/':case '|':case '&':
+#if TRACE_PREPRO
+printf("*** patch prepro operator assignment + useless spacing\n");
+#endif
+								opassign=w[0];lw=0;
+								break;
+							default:opassign=0;break;
+						}
+					} else {
+						opassign=0;
+					}
+
 				    if (lw) {
 						Automate[' ']=1;
 						Automate['\t']=1;
@@ -15493,7 +15999,7 @@ printf("expr operator=%c\n",c);
 					} else {
 						/* 2018.06.06 évolution sur le ! (not) */
 #if TRACE_PREPRO
-printf("*** operateur commence le mot\n");						
+printf("*** operateur commence le mot\n");
 printf("mot precedent=[%s] t=%d\n",wordlist[nbword-1].w,wordlist[nbword-1].t);
 #endif
 						if (hadcomma && c=='!') {
@@ -15535,6 +16041,14 @@ printf("mot precedent=[%s] t=%d\n",wordlist[nbword-1].w,wordlist[nbword-1].t);
 								}
 								MemFree(wordlist[nbword].w);
 								/* on ajoute l'egalite ou comparaison! */
+								if (opassign) {
+									#if TRACE_PREPRO
+									printf("*** patch opassign en finalisation de mot\n");
+									#endif
+									w[lw++]=opassign;
+									StateMachineResizeBuffer(&w,lw,&mw);
+									w[lw]=0;
+								}
 								curw.e=lw+1;
 							}
 							w[lw++]=c;
@@ -15901,6 +16415,9 @@ int RasmAssembleInfo(const char *datain, int lenin, unsigned char **dataout, int
 #define AUTOTEST_LZSEGMENT	"org #100:debut:jr nz,zend:lz48:repeat 128:nop:rend:lzclose:jp zend:lz48:repeat 2:dec a:jr nz,@next:ld a,5:@next:jp debut:rend:" \
 							"lzclose:zend"
 
+#define AUTOTEST_LZDEFERED	"lz48:defs 20:lzclose:defb $"
+
+
 #define AUTOTEST_PAGETAG	"bankset 0:org #5000:label1:bankset 1:org #9000:label2:bankset 2:" \
 							"assert {page}label1==0x7FC0:assert {page}label2==0x7FC6:assert {pageset}label1==#7FC0:assert {pageset}label2==#7FC2:nop"
 							
@@ -15953,6 +16470,11 @@ int RasmAssembleInfo(const char *datain, int lenin, unsigned char **dataout, int
 
 #define AUTOTEST_MACROPROX	" macro unemacro: nop: endm: global_label: ld hl, .table: .table"
 
+#define AUTOTEST_MACRO_CONF01   " nop: macro label1: nop: mend: macro label1: nop: mend:"
+#define AUTOTEST_MACRO_CONF02   " label1=0: macro label1: nop: mend: nop:"
+#define AUTOTEST_MACRO_CONF03   " label1 equ #100: macro label1: nop: mend: nop:"
+#define AUTOTEST_MACRO_CONF04   " label1 nop: macro label1: nop: mend: nop"
+
 #define AUTOTEST_PROXBACK	" macro grouik: @truc djnz @truc: .unprox djnz .unprox: mend:" \
 				"ld b,2: unglobal nop: djnz unglobal: ld b,2: .unprox nop: djnz .unprox: beforelocal=$ :" \
 				"repeat 2: @unlocal: ld b,2: .unprox nop: djnz .unprox: grouik : djnz .unprox : rend: assert .unprox < beforelocal : nop"
@@ -15980,7 +16502,7 @@ int RasmAssembleInfo(const char *datain, int lenin, unsigned char **dataout, int
 #define AUTOTEST_DEFS "defs 256,0"
 
 #define AUTOTEST_LIMIT03	"limit -1 : nop"
-#define AUTOTEST_LIMIT04	"limit #10000 : nop"
+#define AUTOTEST_LIMIT04	"limit #10001 : nop"
 #define AUTOTEST_LIMIT05	"org #FFFF : ldir"
 #define AUTOTEST_LIMIT06	"org #FFFF : nop"
 
@@ -16041,7 +16563,19 @@ int RasmAssembleInfo(const char *datain, int lenin, unsigned char **dataout, int
 				"a>>=1 : assert a==20 : nop"
 #define AUTOTEST_OPERATORASSIGN2 "a=1 : a+=2 : assert a==3 : repeat 2 : a+=10 : rend : assert a==23: a=1 : a-=2 : assert a==-1 : repeat 2 : a-=10 : rend : assert a==-21: " \
 				"a=3 : a*=2 : assert a==6 : repeat 2 : a*=10 : rend : assert a==600: a=600 : a/=2 : assert a==300 : repeat 2 : a/=10 : rend : assert a==3 : nop"
+#define AUTOTEST_OPERATORASSIGN3 "a=1 : a += 2 : assert a==3 : repeat 2 : a += 10 : rend : assert a==23: a=1 : a -= 2 : assert a==-1 : repeat 2 : a -= 10 : rend : assert a==-21: " \
+				"a=3 : a *= 2 : assert a==6 : repeat 2 : a *= 10 : rend : assert a==600: a=600 : a /= 2 : assert a==300 : repeat 2 : a /= 10 : rend : assert a==3 : nop"
 
+#define AUTOTEST_MODULE01 "org 0: nop: preums nop  : .prox1      : djnz preums : djnz .prox1 : defs 200 : djnz gourni_preums: djnz gourni_preums.prox1: djnz grouik_preums: " \
+			"djnz grouik_preums.prox1: module grouik: preums nop: .prox1: djnz preums: djnz .prox1: djnz gourni_preums: module gourni: ld (.prox1),a: ld (preums.prox1),a: " \
+			"preums nop: .prox1: djnz preums: djnz .prox1: djnz grouik_preums: assert preums!=1: module : plop: : module quatre: : jp plop: bip: jr bip: " \
+			" : assert preums==1: module OFF: : assert preums==1 "
+
+#define AUTOTEST_PUSHPOPGLOBAL "unglobal: nop: repeat 2: @unlocal: .prox nop: rend: .prox nop: apres=$: macro unemacro: @inside: nop: .prox: nop: assert .prox>@inside: djnz .prox: " \
+			"mend: macro deuxmacros: @inside: nop: .prox: nop: unemacro: nop: djnz .prox: assert  .prox>@inside: mend: unemacro (void): assert .prox<apres: " \
+			"djnz .prox: deuxmacros (void): djnz .prox: assert .prox<apres "
+#define AUTOTEST_MODULE02 "unglobal: nop: .prox: nop: module un: deuxglobal: nop: .prox: nop: djnz .prox: nop: doublon: nop: module deux: troisglobal: nop: " \
+			" .prox: nop: djnz .prox: nop: doublon: nop: assert doublon>troisglobal: module: jr un_doublon: jr deux_doublon: jr un_deuxglobal.prox: jr deux_troisglobal.prox "
 
 
 struct s_autotest_keyword {
@@ -16210,8 +16744,8 @@ void RasmAutotest(void)
 	SimplifyPath(tmpstr1);if (strcmp(tmpstr1,tmpstr2)) {printf("Autotest %03d ERROR (Core:SimplifyPath6) %s!=%s\n",cpt,tmpstr1,tmpstr2);exit(-1);}
 	cpt++;
 	printf(".");fflush(stdout);
-	if (strcmp(GetPath("/home/roudoudou/"),"/home/roudoudou/")) {printf("Autotest %03d ERROR (Core:GetPath0) [%s]\n",cpt,GetPath("/home/roudoudou/"));exit(-1);}
-	if (strcmp(GetPath("/home/roudoudou"),"/home/")) {printf("Autotest %03d ERROR (Core:GetPath1) [%s]\n",cpt,GetPath("/home/roudoudou"));exit(-1);}
+	if (strcmp(rasm_GetPath("/home/roudoudou/"),"/home/roudoudou/")) {printf("Autotest %03d ERROR (Core:rasm_GetPath) [%s]\n",cpt,rasm_GetPath("/home/roudoudou/"));exit(-1);}
+	if (strcmp(rasm_GetPath("/home/roudoudou"),"/home/")) {printf("Autotest %03d ERROR (Core:rasm_GetPath) [%s]\n",cpt,rasm_GetPath("/home/roudoudou"));exit(-1);}
 	cpt++;
 	#endif
 #endif
@@ -16367,6 +16901,11 @@ printf("testing delayed RUN OK\n");
 	if (opcode) MemFree(opcode);opcode=NULL;cpt++;
 printf("testing LZ segment relocation OK\n");
 	
+	ret=RasmAssemble(AUTOTEST_LZDEFERED,strlen(AUTOTEST_LZDEFERED),&opcode,&opcodelen);
+	if (!ret && opcodelen==7 && opcode[6]==6) {} else {printf("Autotest %03d ERROR (LZ segment + defered $)\n",cpt);exit(-1);}
+	if (opcode) MemFree(opcode);opcode=NULL;cpt++;
+printf("testing LZ segment + defered $ OK\n");
+	
 	ret=RasmAssemble(AUTOTEST_LZ4,strlen(AUTOTEST_LZ4),&opcode,&opcodelen);
 	if (!ret && opcodelen==49 && opcode[0]==0x15 && opcode[4]==0x44 && opcode[0xB]==0xF0) {} else {printf("Autotest %03d ERROR (LZ4 segment)\n",cpt);MiniDump(opcode,opcodelen);exit(-1);}
 	if (opcode) MemFree(opcode);opcode=NULL;cpt++;
@@ -16482,6 +17021,26 @@ printf("testing NOT operator OK\n");
 	if (opcode) MemFree(opcode);opcode=NULL;cpt++;
 printf("testing macro usage OK\n");
 	
+	ret=RasmAssemble(AUTOTEST_MACRO_CONF01,strlen(AUTOTEST_MACRO_CONF01),&opcode,&opcodelen);
+	if (ret) {} else {printf("Autotest %03d ERROR (macro name conflict with another macro)\n",cpt);exit(-1);}
+	if (opcode) MemFree(opcode);opcode=NULL;cpt++;
+printf("testing macro usage 2 OK\n");
+	
+	ret=RasmAssemble(AUTOTEST_MACRO_CONF02,strlen(AUTOTEST_MACRO_CONF02),&opcode,&opcodelen);
+	if (ret) {} else {printf("Autotest %03d ERROR (macro name conflict with a variable)\n",cpt);exit(-1);}
+	if (opcode) MemFree(opcode);opcode=NULL;cpt++;
+printf("testing macro usage 3 OK\n");
+	
+	ret=RasmAssemble(AUTOTEST_MACRO_CONF03,strlen(AUTOTEST_MACRO_CONF03),&opcode,&opcodelen);
+	if (ret) {} else {printf("Autotest %03d ERROR (macro name conflict with an alias)\n",cpt);exit(-1);}
+	if (opcode) MemFree(opcode);opcode=NULL;cpt++;
+printf("testing macro usage 4 OK\n");
+	
+	ret=RasmAssemble(AUTOTEST_MACRO_CONF04,strlen(AUTOTEST_MACRO_CONF04),&opcode,&opcodelen);
+	if (ret) {} else {printf("Autotest %03d ERROR (macro name conflict with a label)\n",cpt);exit(-1);}
+	if (opcode) MemFree(opcode);opcode=NULL;cpt++;
+printf("testing macro usage 5 OK\n");
+	
 	ret=RasmAssemble(AUTOTEST_ASSERT,strlen(AUTOTEST_ASSERT),&opcode,&opcodelen);
 	if (!ret) {} else {printf("Autotest %03d ERROR (assert usage)\n",cpt);exit(-1);}
 	if (opcode) MemFree(opcode);opcode=NULL;cpt++;
@@ -16521,6 +17080,16 @@ printf("testing variables in aliases OK\n");
 	if (!ret && opcodelen==9 && opcode[0]==6 && opcode[2]==7 && opcode[4]==8) {} else {printf("Autotest %03d ERROR (delayed expr labels) r=%d l=%d\n",cpt,ret,opcodelen);MiniDump(opcode,opcodelen);exit(-1);}
 	if (opcode) MemFree(opcode);opcode=NULL;cpt++;
 printf("testing delayed expression labels OK\n");
+
+	ret=RasmAssemble(AUTOTEST_MODULE01,strlen(AUTOTEST_MODULE01),&opcode,&opcodelen);
+	if (!ret) {} else {printf("Autotest %03d ERROR (modules)\n",cpt);exit(-1);}
+	if (opcode) MemFree(opcode);opcode=NULL;cpt++;
+printf("testing modules + proximity OK\n");
+
+	ret=RasmAssemble(AUTOTEST_MODULE02,strlen(AUTOTEST_MODULE02),&opcode,&opcodelen);
+	if (!ret) {} else {printf("Autotest %03d ERROR (modules 2)\n",cpt);exit(-1);}
+	if (opcode) MemFree(opcode);opcode=NULL;cpt++;
+printf("testing modules + proximity (bis) OK\n");
 
 	ret=RasmAssemble(AUTOTEST_PROXIM,strlen(AUTOTEST_PROXIM),&opcode,&opcodelen);
 	if (!ret && opcode[1]==3) {} else {printf("Autotest %03d ERROR (proximity labels)\n",cpt);exit(-1);}
@@ -16600,6 +17169,11 @@ printf("testing global label back as reference when leaving macro and loops OK\n
 	if (opcode) MemFree(opcode);opcode=NULL;cpt++;
 printf("testing far access of a proximity label refering to local OK\n");
 
+	ret=RasmAssemble(AUTOTEST_PUSHPOPGLOBAL,strlen(AUTOTEST_PUSHPOPGLOBAL),&opcode,&opcodelen);
+	if (!ret) {} else {printf("Autotest %03d ERROR (get back global for proximity inside macro+loops)\n",cpt);MiniDump(opcode,opcodelen);exit(-1);}
+	if (opcode) MemFree(opcode);opcode=NULL;cpt++;
+printf("testing push/pop global label for proximity inside macro+loops OK\n");
+
 	ret=RasmAssemble(AUTOTEST_NEGATIVE,strlen(AUTOTEST_NEGATIVE),&opcode,&opcodelen);
 	if (!ret) {} else {printf("Autotest %03d ERROR (formula case 0)\n",cpt);exit(-1);}
 	if (opcode) MemFree(opcode);opcode=NULL;cpt++;
@@ -16613,7 +17187,12 @@ printf("testing operator assignment OK\n");
 	ret=RasmAssemble(AUTOTEST_OPERATORASSIGN2,strlen(AUTOTEST_OPERATORASSIGN2),&opcode,&opcodelen);
 	if (!ret && opcodelen==1) {} else {printf("Autotest %03d ERROR (operator assignment + repeat)\n",cpt);exit(-1);}
 	if (opcode) MemFree(opcode);opcode=NULL;cpt++;
-printf("testing operator assignment OK\n");
+printf("testing operator assignment + repeat OK\n");
+	
+	ret=RasmAssemble(AUTOTEST_OPERATORASSIGN3,strlen(AUTOTEST_OPERATORASSIGN3),&opcode,&opcodelen);
+	if (!ret && opcodelen==1) {} else {printf("Autotest %03d ERROR (operator assignment + repeat)\n",cpt);exit(-1);}
+	if (opcode) MemFree(opcode);opcode=NULL;cpt++;
+printf("testing operator assignment + repeat + spacing OK\n");
 	
 	ret=RasmAssemble(AUTOTEST_FORMULA1,strlen(AUTOTEST_FORMULA1),&opcode,&opcodelen);
 	if (!ret) {} else {printf("Autotest %03d ERROR (formula case 1)\n",cpt);exit(-1);}
@@ -16972,7 +17551,7 @@ void Usage(int help)
 	
 	printf("%s (c) 2017 Edouard BERGE (use -n option to display all licenses)\n",RASM_VERSION);
 	#ifndef NO_3RD_PARTIES
-	printf("LZ4 (c) Yann Collet / ZX7 (c) Einar Saukas / Exomizer 2 (c) Magnus Lind\n");
+	printf("LZ4 (c) Yann Collet / ZX7 (c) Einar Saukas / Exomizer 2 (c) Magnus Lind / AP-Ultra (c) Emmanuel Marty\n");
 	#endif
 	printf("\n");
 	printf("SYNTAX: rasm <inputfile> [options]\n");
@@ -17025,6 +17604,7 @@ void Usage(int help)
 		printf("-v2 export snapshot version 2 instead of version 3\n");
 		printf("PARSING:\n");
 		printf("-me <value>    set maximum number of error (0 means no limit)\n");
+		printf("-twe           treat warnings as errors\n");
 		printf("-xr            extended error display\n");
 		printf("-w             disable warnings\n");
 		printf("-void          force void usage with macro without parameter\n");
@@ -17079,7 +17659,7 @@ printf("Software. \"\n");
 
 #ifndef NO_3RD_PARTIES
 printf("\n\n\n\n");
-printf("******* license of LZ4 cruncher / sources were modified ***********\n\n\n\n");
+printf("******* license for LZ4 cruncher / sources were modified ***********\n\n\n\n");
 
 printf("BSD 2-Clause License (http://www.opensource.org/licenses/bsd-license.php)\n");
 
@@ -17112,8 +17692,7 @@ printf(" - LZ4 source repository : https://github.com/lz4/lz4\n");
 
 
 printf("\n\n\n\n");
-printf("******* license of ZX7 cruncher / sources were modified ***********\n\n\n\n");
-
+printf("******* license for ZX7 cruncher / sources were modified ***********\n\n\n\n");
 
 printf(" * (c) Copyright 2012 by Einar Saukas. All rights reserved.\n");
 printf(" *\n");
@@ -17140,8 +17719,7 @@ printf(" * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.\n");
 
 
 printf("\n\n\n\n");
-printf("******* license of exomizer cruncher / sources were modified ***********\n\n\n\n");
-
+printf("******* license for exomizer cruncher / sources were modified ***********\n\n\n\n");
 
 printf(" * Copyright (c) 2005 Magnus Lind.\n");
 printf(" *\n");
@@ -17166,6 +17744,38 @@ printf(" *\n");
 printf(" *   4. The names of this software and/or it's copyright holders may not be\n");
 printf(" *   used to endorse or promote products derived from this software without\n");
 printf(" *   specific prior written permission.\n");
+
+
+printf("\n\n\n\n");
+printf("******* license for AP-Ultra cruncher / sources were modified ***********\n\n\n\n");
+printf(" * apultra.c - command line compression utility for the apultra library\n");
+printf(" * Copyright (C) 2019 Emmanuel Marty\n");
+printf(" *\n");
+printf(" * This software is provided 'as-is', without any express or implied\n");
+printf(" * warranty.  In no event will the authors be held liable for any damages\n");
+printf(" * arising from the use of this software.\n");
+printf(" *\n");
+printf(" * Permission is granted to anyone to use this software for any purpose,\n");
+printf(" * including commercial applications, and to alter it and redistribute it\n");
+printf(" * freely, subject to the following restrictions:\n");
+printf(" *\n");
+printf(" * 1. The origin of this software must not be misrepresented; you must not\n");
+printf(" *    claim that you wrote the original software. If you use this software\n");
+printf(" *    in a product, an acknowledgment in the product documentation would be\n");
+printf(" *    appreciated but is not required.\n");
+printf(" * 2. Altered source versions must be plainly marked as such, and must not be\n");
+printf(" *    misrepresented as being the original software.\n");
+printf(" * 3. This notice may not be removed or altered from any source distribution.\n");
+printf(" *\n");
+printf(" * Uses the libdivsufsort library Copyright (c) 2003-2008 Yuta Mori\n");
+printf(" *\n");
+printf(" * Inspired by cap by Sven-Åke Dahl. https://github.com/svendahl/cap\n");
+printf(" * Also inspired by Charles Bloom's compression blog. http://cbloomrants.blogspot.com/\n");
+printf(" * With ideas from LZ4 by Yann Collet. https://github.com/lz4/lz4\n");
+printf(" * With help and support from spke <zxintrospec@gmail.com>\n");
+printf("\n");
+printf("\n");
+
 #endif
 
 printf("\n\n");
@@ -17217,6 +17827,8 @@ int ParseOptions(char **argv,int argc, struct s_parameter *param)
 		RasmAutotest();
 	} else if (strcmp(argv[i],"-uz")==0) {
 		param->as80=2;
+	} else if (strcmp(argv[i],"-twe")==0) {
+		param->erronwarn=1;
 	} else if (strcmp(argv[i],"-ass")==0) {
 		param->as80=1;
 	} else if (strcmp(argv[i],"-eb")==0) {
@@ -17400,7 +18012,7 @@ printf("@@@\n@@@ --> deprecated option, there is no need to use -i option to set
 				break;
 			case 'v':
 				if (!argv[i][2]) {
-					printf("deprecated option -v\n");
+					param->display_stats=1;
 				} else if (argv[i][2]=='2') {
 					param->v2=1;
 				}
