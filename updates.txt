@@ -1,3 +1,27 @@
+update v0.129
+- bugfix read overrun in pre-processor
+- bugfix read overrun in snapshot encoding
+- bugfix AMSDOS header creation with filename that contains a path
+- force memory cleanup with MorphOS
+- when a variable cannot be computed, check for directive names to avoid confusion
+
+update v0.128
+- bugfix moar memory leaks
+- label code clean-up
+
+update v0.127
+- bugfix some memory leaks
+
+update v0.126
+- Rasm is able to mix LZsegments and contiguous ORG sections
+
+update v0.125
+- bugfix EQU with current adress reference and crunched zones integration
+
+update v0.124
+- new directive DF/DEFF in order to output Microsoft IEEE-754 40bits real
+- pasmo compatibility option for DEFB/DEFW with multiple output and reference to current adress
+
 update v0.123
 - new option to treat warnings as errors
 - bugfix segfault with empty struct declaration

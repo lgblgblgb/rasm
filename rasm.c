@@ -1,5 +1,5 @@
 #define PROGRAM_NAME      "RASM"
-#define PROGRAM_VERSION   "0.123"
+#define PROGRAM_VERSION   "0.129"
 #define PROGRAM_DATE      "xx/06/2020"
 #define PROGRAM_COPYRIGHT "© 2017 BERGE Edouard / roudoudou from Resistance"
 
@@ -46,21 +46,21 @@ arising from,  out of  or in connection  with  the software  or  the  use  or  o
 Software. »
 -----------------------------------------------------------------------------------------------------
 Linux compilation with GCC or Clang:
-cc rasm_v0122.c -O2 -lm -lrt -march=native -o rasm
+cc rasm_v0127.c -O2 -lm -lrt -march=native -o rasm
 strip rasm
 
 Windows compilation with Visual studio:
-cl.exe rasm_v0122.c -O2 -Ob3
+cl.exe rasm_v0127.c -O2 -Ob3
 
 pure MS-DOS 32 bits compilation with Watcom:
-wcl386 rasm_v0122.c -6r -6s -fp6 -d0 -k4000000 -ox /bt=DOS /l=dos4g
+wcl386 rasm_v0127.c -6r -6s -fp6 -d0 -k4000000 -ox /bt=DOS /l=dos4g -DOS_WIN=1 -DNOAPLIB=1
 
 MorphOS compilation (ixemul):
-ppc-morphos-gcc-5 -O2 -c -o rasm rasm_v0122.c
+ppc-morphos-gcc-5 -O2 -c -o rasm rasm_v0127.c
 strip rasm
 
 MacOS compilation:
-cc rasm_v0122.c -O2 -lm -march=native -o rasm
+cc rasm_v0127.c -O2 -lm -march=native -o rasm
 
 */
 
@@ -91,7 +91,10 @@ cc rasm_v0122.c -O2 -lm -march=native -o rasm
 #include"zx7.h"
 #include"lz4.h"
 #include"exomizer.h"
-#include"apultra.h"
+/* too much trouble with old DOS compiler */
+ #ifndef NOAPULTRA
+  #include"apultra.h"
+ #endif
 #endif
 
 #ifdef __MORPHOS__
@@ -154,7 +157,7 @@ struct s_parameter {
 	int display_stats;
 	int edskoverwrite;
 	float rough;
-	int as80,dams;
+	int as80,dams,pasmo;
 	int v2;
 	int warn_unused;
 	char *symbol_name;
@@ -281,6 +284,7 @@ enum e_expression {
 	E_EXPRESSION_0V16,   /* 16 bits value to current adress */
 	E_EXPRESSION_0V32,   /* 32 bits value to current adress */
 	E_EXPRESSION_0VR,    /* AMSDOS real value (5 bytes) to current adress */
+	E_EXPRESSION_0VRMike,/* Microsoft IEEE-754 real value (5 bytes) to current adress */
 	E_EXPRESSION_IV8,    /* 8 bits value to current adress+2 */
 	E_EXPRESSION_IV81,   /* 8 bits value+1 to current adress+2 */
 	E_EXPRESSION_3V8,    /* 8 bits value to current adress+3 used with LD (IX+n),n */
@@ -377,7 +381,7 @@ struct s_crcstring_tree {
 struct s_lz_section {
 	int iw;
 	int memstart,memend;
-	int lzversion; /* 4 -> LZ4 / 7 -> ZX7 / 48 -> LZ48 / 49 -> LZ49 / 8 -> Exomizer */
+	int lzversion; /* 0 -> NO CRUNCH but must be delayed / 4 -> LZ4 / 7 -> ZX7 / 48 -> LZ48 / 49 -> LZ49 / 8 -> Exomizer */
 	int iorgzone;
 	int ibank;
 	/* idx backup */
@@ -390,6 +394,7 @@ struct s_orgzone {
 	int memstart,memend;
 	int ifile,iline;
 	int nocode;
+	int inplace;
 };
 
 /**************************************************
@@ -820,7 +825,7 @@ struct s_assenv {
 	/* expressions */
 	struct s_expression *expression;
 	int ie,me;
-	int maxam,as80,dams;
+	int maxam,as80,dams,pasmo;
 	float rough;
 	struct s_compute_core_data *computectx,ctx1,ctx2;
 	struct s_crcstring_tree stringtree;
@@ -1050,9 +1055,11 @@ struct s_math_keyword math_keyword[]={
 #define CRC_DS		0x4BD5DF0F
 #define CRC_DEFR	0x37D15399
 #define CRC_DR		0x4BD5DF0E
+#define CRC_DEFF	0x37D1538D
+#define CRC_DF	        0x4BD5DF02
 
 /* struct declaration use special instructions for defines */
-int ICRC_DEFB,ICRC_DEFW,ICRC_DEFI,ICRC_DEFR,ICRC_DEFS,ICRC_DB,ICRC_DW,ICRC_DR,ICRC_DS;
+int ICRC_DEFB,ICRC_DEFW,ICRC_DEFI,ICRC_DEFR,ICRC_DEFF,ICRC_DF,ICRC_DEFS,ICRC_DB,ICRC_DW,ICRC_DR,ICRC_DS;
 /* need to pre-declare var */
 extern struct s_asm_keyword instruction[];
 
@@ -1904,8 +1911,172 @@ void MakeError(struct s_assenv *ae, char *filename, int line, char *format, ...)
 	}
 }
 
+/* convert v double value to Microsoft REAL 
+ *
+ * https://en.wikipedia.org/wiki/Microsoft_Binary_Format
+ *
+ * exponent:8
+ * sign:1
+ * mantiss:23
+ *
+ * */
+unsigned char *__internal_MakeRosoftREAL(struct s_assenv *ae, double v, int iexpression)
+{
+	#undef FUNC
+	#define FUNC "__internal_MakeRosoftREAL"
+	
+	static unsigned char rc[5]={0};
 
-/* convert v double value to Amstrad REAL */
+	double tmpval;
+	int j,ib,ibb,exp=0;
+	unsigned int deci;
+	int fracmax=0;
+	double frac;
+	int mesbits[32];
+	int ibit=0;
+	unsigned int mask;
+
+	memset(rc,0,sizeof(rc));
+
+	deci=fabs(floor(v));
+	frac=fabs(v)-deci;
+
+	if (deci) {
+		mask=0x80000000;
+		while (!(deci & mask)) mask=mask/2;
+		while (mask) {
+			mesbits[ibit]=!!(deci & mask);
+#if TRACE_MAKEAMSDOSREAL
+printf("%d",mesbits[ibit]);
+#endif
+			ibit++;
+			mask=mask/2;
+		}
+#if TRACE_MAKEAMSDOSREAL
+printf("\nexposant positif: %d\n",ibit);
+#endif
+		exp=ibit;
+#if TRACE_MAKEAMSDOSREAL
+printf(".");
+#endif
+		while (ibit<32 && frac!=0) {
+			frac=frac*2;
+			if (frac>=1.0) {
+				mesbits[ibit++]=1;
+#if TRACE_MAKEAMSDOSREAL
+printf("1");
+#endif
+				frac-=1.0;
+			} else {
+				mesbits[ibit++]=0;
+#if TRACE_MAKEAMSDOSREAL
+printf("0");
+#endif
+			}
+			fracmax++;
+		}
+	} else {
+#if TRACE_MAKEAMSDOSREAL
+printf("\nexposant negatif a definir:\n");
+printf("x.");
+#endif
+		
+		/* handling zero */
+		if (frac==0.0) {
+#if TRACE_MAKEAMSDOSREAL
+printf("\ncas special ZERO:\n");
+#endif
+			exp=0;
+			ibit=0;
+		} else {
+			/* looking for first significant bit */
+			while (1) {
+				frac=frac*2;
+				if (frac>=1.0) {
+					mesbits[ibit++]=1;
+#if TRACE_MAKEAMSDOSREAL
+printf("1");
+#endif
+					frac-=1.0;
+					break; /* first significant bit found, now looking for limit */
+				} else {
+#if TRACE_MAKEAMSDOSREAL
+printf("o");
+#endif
+				}
+				fracmax++;
+				exp--;
+			}
+			while (ibit<32 && frac!=0) {
+				frac=frac*2;
+				if (frac>=1.0) {
+					mesbits[ibit++]=1;
+#if TRACE_MAKEAMSDOSREAL
+printf("1");
+#endif
+					frac-=1.0;
+				} else {
+					mesbits[ibit++]=0;
+#if TRACE_MAKEAMSDOSREAL
+printf("0");
+#endif
+				}
+				fracmax++;
+			}
+		}
+	}
+
+#if TRACE_MAKEAMSDOSREAL
+printf("\n%d bits utilises en mantisse\n",ibit);
+#endif
+	/* pack bits */
+	ib=3;ibb=0x80;
+	for (j=0;j<ibit;j++) {
+		if (mesbits[j])	rc[ib]|=ibb;
+		ibb/=2;
+		if (ibb==0) {
+			ibb=0x80;
+			ib--;
+		}
+	}
+	/* exponent */
+	if (exp==0 && ibit==0) {
+		/* special zero */
+	} else {
+		exp+=128;
+		if (exp<0 || exp>255) {
+			if (iexpression) MakeError(ae,GetExpFile(ae,iexpression),ae->wl[ae->expression[iexpression].iw].l,"Exponent overflow\n");
+			else MakeError(ae,GetExpFile(ae,0),ae->wl[ae->idx].l,"Exponent overflow\n");
+			exp=128;
+		}
+	}
+	rc[4]=exp;
+
+	/* Microsoft REAL sign */
+	if (v>=0) {
+		rc[3]&=0x7F;
+	} else {
+		rc[3]|=0x80;
+	}
+
+#if TRACE_MAKEAMSDOSREAL
+	for (j=0;j<5;j++) printf("%02X ",rc[j]);
+	printf("\n");
+#endif
+
+	return rc;
+}
+
+
+/* convert v double value to Amstrad REAL 
+ *
+ * http://www.cpcwiki.eu/index.php?title=Technical_information_about_Locomotive_BASIC&mobileaction=toggle_view_desktop#Floating_Point_data_definition
+ *
+ * exponent:8
+ * sign:1
+ * mantiss:23
+ *
+ * */
 unsigned char *__internal_MakeAmsdosREAL(struct s_assenv *ae, double v, int iexpression)
 {
 	#undef FUNC
@@ -2135,7 +2306,10 @@ void FreeAssenv(struct s_assenv *ae)
 
 #ifndef RDD
 	/* let the system free the memory in command line except when debug/dev */
+	#ifndef __MORPHOS__
+	/* MorphOS does not like when memory is not freed before exit */
 	if (!ae->flux) return;
+	#endif
 #endif
 	/*** debug info ***/	
 	if (!ae->retdebug) {
@@ -2209,6 +2383,7 @@ void FreeAssenv(struct s_assenv *ae)
 		for (j=0;j<ae->rasmstruct[i].irasmstructfield;j++) {
 			MemFree(ae->rasmstruct[i].rasmstructfield[j].fullname);
 			MemFree(ae->rasmstruct[i].rasmstructfield[j].name);
+			if (ae->rasmstruct[i].rasmstructfield[j].mdata) MemFree(ae->rasmstruct[i].rasmstructfield[j].data);
 		}
 		if (ae->rasmstruct[i].mrasmstructfield) MemFree(ae->rasmstruct[i].rasmstructfield);
 		MemFree(ae->rasmstruct[i].name);
@@ -2246,6 +2421,16 @@ void FreeAssenv(struct s_assenv *ae)
 
 	
 	if (ae->mmacro) MemFree(ae->macro);
+
+	for (i=0;i<ae->igs;i++) {
+		if (ae->globalstack[i]) MemFree(ae->globalstack[i]);
+	}
+	if (ae->mgs) MemFree(ae->globalstack);
+	if (ae->lastglobalalloc) {
+		MemFree(ae->lastgloballabel);
+		ae->lastglobalalloc=0;
+		ae->lastgloballabel=NULL;
+	}
 
 	for (i=0;i<ae->ialias;i++) {
 		MemFree(ae->alias[i].alias);
@@ -2533,7 +2718,7 @@ int SearchAlias(struct s_assenv *ae, int crc, char *zemot)
 			while (ae->alias[dm].crc==crc && strcmp(ae->alias[dm].alias,zemot)) dm++;
 			if (ae->alias[dm].crc==crc && strcmp(ae->alias[dm].alias,zemot)==0) {
 				ae->alias[dm].used=1;
-//printf("found\n");
+//printf("[%s] found => [%s]\n",zemot,ae->alias[dm].translation);
 				return dm;
 			} else return -1;
 		} else if (ae->alias[dm].crc>crc) {
@@ -4106,8 +4291,8 @@ printf("page=%d | ptr=%X ibank=%d\n",page,curlabel->ptr,curlabel->ibank);
 												}
 											}
 										} else {
-											/* label MUST be in the crunched block */
-											if (curlabel->iorgzone==ae->expression[didx].iorgzone && curlabel->ibank==ae->expression[didx].ibank && curlabel->lz<=ae->expression[didx].lz) {
+											/* label MUST be intermediate OR in the crunched block */
+											if (ae->lzsection[curlabel->lz].lzversion==0 || (curlabel->iorgzone==ae->expression[didx].iorgzone && curlabel->ibank==ae->expression[didx].ibank && curlabel->lz<=ae->expression[didx].lz)) {
 												if (!bank) {
 													curval=curlabel->ptr;
 												} else {
@@ -4271,12 +4456,17 @@ printf("stage 2 | page=%d | ptr=%X ibank=%d\n",page,curlabel->ptr,curlabel->iban
 												if (IsRegister(ae->computectx->varbuffer+minusptr)) {
 													MakeError(ae,GetExpFile(ae,didx),GetExpLine(ae,didx),"cannot use register %s in this context\n",TradExpression(zeexpression));
 												} else {
-													MakeError(ae,GetExpFile(ae,didx),GetExpLine(ae,didx),"expression [%s] keyword [%s] not found in variables, labels or aliases\n",TradExpression(zeexpression),ae->computectx->varbuffer+minusptr);
-													if (ae->extended_error) {
-														char *lookstr;
-														lookstr=StringLooksLike(ae,ae->computectx->varbuffer+minusptr);
-														if (lookstr) {
-															rasm_printf(ae,KERROR" did you mean [%s] ?\n",lookstr);
+													if (IsDirective(ae->computectx->varbuffer+minusptr)) {
+														MakeError(ae,GetExpFile(ae,didx),GetExpLine(ae,didx),"cannot use directive %s in this context\n",TradExpression(zeexpression));
+													} else {
+
+														MakeError(ae,GetExpFile(ae,didx),GetExpLine(ae,didx),"expression [%s] keyword [%s] not found in variables, labels or aliases\n",TradExpression(zeexpression),ae->computectx->varbuffer+minusptr);
+														if (ae->extended_error) {
+															char *lookstr;
+															lookstr=StringLooksLike(ae,ae->computectx->varbuffer+minusptr);
+															if (lookstr) {
+																rasm_printf(ae,KERROR" did you mean [%s] ?\n",lookstr);
+															}
 														}
 													}
 												}
@@ -4931,6 +5121,10 @@ int RoundComputeExpression(struct s_assenv *ae,char *expr, int ptr, int didx, in
 	ExpressionFastTranslate
 	
 	purpose: translate all known symbols in an expression (especially variables acting like counters)
+
+0:
+1:
+2: (equ declaration)
 */
 void ExpressionFastTranslate(struct s_assenv *ae, char **ptr_expr, int fullreplace)
 {
@@ -5113,8 +5307,9 @@ void ExpressionFastTranslate(struct s_assenv *ae, char **ptr_expr, int fullrepla
 			found_replace=0;
 			/* pour les affectations ou les tests conditionnels on ne remplace pas le dico (pour le Push oui par contre!) */
 			if (fullreplace) {
+//printf("ExpressionFastTranslate (full) => varbuffer=[%s] lz=%d\n",varbuffer,ae->lz);
 				if (varbuffer[0]=='$' && !varbuffer[1]) {
-					if (!ae->lz) {
+					if (ae->lz==-1) {
 						#ifdef OS_WIN
 						snprintf(curval,sizeof(curval)-1,"%d",ae->codeadr);
 						newlen=strlen(curval);
@@ -5513,6 +5708,7 @@ void PushExpression(struct s_assenv *ae,int iw,enum e_expression zetype)
 			case E_EXPRESSION_0V16:curexp.ptr=ae->codeadr;ae->outputadr+=2;ae->codeadr+=2;break;
 			case E_EXPRESSION_0V32:curexp.ptr=ae->codeadr;ae->outputadr+=4;ae->codeadr+=4;break;
 			case E_EXPRESSION_0VR:curexp.ptr=ae->codeadr;ae->outputadr+=5;ae->codeadr+=5;break;
+			case E_EXPRESSION_0VRMike:curexp.ptr=ae->codeadr;ae->outputadr+=5;ae->codeadr+=5;break;
 			case E_EXPRESSION_V16C:
 			case E_EXPRESSION_V16:curexp.ptr=ae->codeadr-1;ae->outputadr+=2;ae->codeadr+=2;break;
 			case E_EXPRESSION_IV81:curexp.ptr=ae->codeadr-2;ae->outputadr++;ae->codeadr++;break;
@@ -5544,6 +5740,7 @@ void PushExpression(struct s_assenv *ae,int iw,enum e_expression zetype)
 			case E_EXPRESSION_0V16:ae->outputadr+=2;ae->codeadr+=2;break;
 			case E_EXPRESSION_0V32:ae->outputadr+=4;ae->codeadr+=4;break;
 			case E_EXPRESSION_0VR:ae->outputadr+=5;ae->codeadr+=5;break;
+			case E_EXPRESSION_0VRMike:ae->outputadr+=5;ae->codeadr+=5;break;
 			case E_EXPRESSION_V16C:
 			case E_EXPRESSION_V16:ae->outputadr+=2;ae->codeadr+=2;break;
 			case E_EXPRESSION_IV81:ae->outputadr++;ae->codeadr++;break;
@@ -5633,14 +5830,21 @@ int EDSK_getdirid(struct s_edsk_wrapper *curwrap) {
 	}
 	return -1;
 }
-char *MakeAMSDOS_name(struct s_assenv *ae, char *filename)
+char *MakeAMSDOS_name(struct s_assenv *ae, char *reference_filename)
 {
 	#undef FUNC
 	#define FUNC "MakeAMSDOS_name"
 
 	static char amsdos_name[12];
-	int i,ia;
+	char *filename,*jo;
+	int i,ia,slash;
 	char *pp;
+
+	/* remove path */
+	filename=reference_filename;
+	while ((jo=strchr(filename,'/'))!=NULL) filename=jo+1;
+	while ((jo=strchr(filename,'\\'))!=NULL) filename=jo+1;
+
 	/* warning */
 	if (strlen(filename)>12) {
 		if (!ae->nowarning) {
@@ -6383,14 +6587,17 @@ void PopAllSave(struct s_assenv *ae)
 
 		if (size<1 || size>65536) {
 			MakeError(ae,NULL,0,"cannot save [%s] as the size is invalid!\n",filename);
+			MemFree(filename);
 			continue;
 		}
 		if (offset<0 || offset>65535) {
 			MakeError(ae,NULL,0,"cannot save [%s] as the offset is invalid!\n",filename);
+			MemFree(filename);
 			continue;
 		}
 		if (offset+size>65536) {
 			MakeError(ae,NULL,0,"cannot save [%s] as the offset+size will be out of bounds!\n",filename);
+			MemFree(filename);
 			continue;
 		}
 		/* DSK management */
@@ -6401,7 +6608,7 @@ void PopAllSave(struct s_assenv *ae)
 				dskfilename[strlen(dskfilename)-1]=0;
 				if (!EDSK_addfile(ae,dskfilename+1,ae->save[is].face,filename,ae->mem[ae->save[is].ibank]+offset,size,offset,run)) {
 					erreur++;
-					break;
+					//break;
 				}
 				MemFree(dskfilename);
 			}
@@ -6519,10 +6726,11 @@ void PopAllExpression(struct s_assenv *ae, int crunched_zone)
 	}
 	
 	for (i=first;i<ae->ie;i++) {
-		/* first compute only crunched expression (0,1,2,3,...) then (-1) at the end */
+		/* first compute only crunched expression (0,1,2,3,...) then intermediates and (-1) at the end */
 		if (crunched_zone>=0) {
-			/* calcul des expressions en zone crunch */
+			/* jump over previous crunched or non-crunched zones */
 			if (ae->expression[i].lz<crunched_zone) continue;
+			/* OPTIM: keep index and stop when we are after the current crunched zone */
 			if (ae->expression[i].lz>crunched_zone) {
 				first=i;
 				break;
@@ -6592,6 +6800,10 @@ void PopAllExpression(struct s_assenv *ae, int crunched_zone)
 			case E_EXPRESSION_0VR:
 				/* convert v double value to Amstrad REAL */
 				memcpy(&mem[ae->expression[i].wptr],__internal_MakeAmsdosREAL(ae,v,i),5);
+				break;
+			case E_EXPRESSION_0VRMike:
+				/* convert v double value to Microsoft 40bits REAL */
+				memcpy(&mem[ae->expression[i].wptr],__internal_MakeRosoftREAL(ae,v,i),5);
 				break;
 			case E_EXPRESSION_IM:
 				switch (r) {
@@ -6706,7 +6918,6 @@ void PushLabel(struct s_assenv *ae)
 	#define FUNC "PushLabel"
 	
 	struct s_label curlabel={0},*searched_label;
-	char *curlabelname;
 	int i,im;
 	/* label with counters */
 	struct s_expr_dico *curdic;
@@ -6777,8 +6988,10 @@ void PushLabel(struct s_assenv *ae)
 
 	/*******************************************************
 	   v a r i a b l e s     i n    l a b e l    n a m e
+
+	           -- varbuffer is always allocated --
 	*******************************************************/
-	varbuffer=TranslateTag(ae,TxtStrDup(ae->wl[ae->idx].w),&touched,1,E_TAGOPTION_NONE);
+	varbuffer=TranslateTag(ae,TxtStrDup(ae->wl[ae->idx].w),&touched,1,E_TAGOPTION_NONE); // on se moque du touched ici => varbuffer toujours "new"
 #if TRACE_LABEL
 	printf("label after translation [%s]\n",varbuffer);
 #endif
@@ -6792,16 +7005,17 @@ void PushLabel(struct s_assenv *ae)
 #endif
 		if (varbuffer[0]=='@') {
 			MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"Please no local label in a struct [%s]\n",ae->wl[ae->idx].w);
+			MemFree(varbuffer);
 			return;
 		}
 		/* copy label+offset in the structure */
-		rasmstructfield.name=TxtStrDup(varbuffer);
+		rasmstructfield.name=varbuffer;
 		rasmstructfield.offset=ae->codeadr;
 		ObjectArrayAddDynamicValueConcat((void **)&ae->rasmstruct[ae->irasmstruct-1].rasmstructfield,
 				&ae->rasmstruct[ae->irasmstruct-1].irasmstructfield,&ae->rasmstruct[ae->irasmstruct-1].mrasmstructfield,
 				&rasmstructfield,sizeof(rasmstructfield));
 		/* label is structname+field */
-		curlabelname=curlabel.name=MemMalloc(strlen(ae->rasmstruct[ae->irasmstruct-1].name)+strlen(varbuffer)+2);
+		curlabel.name=MemMalloc(strlen(ae->rasmstruct[ae->irasmstruct-1].name)+strlen(varbuffer)+2);
 		sprintf(curlabel.name,"%s.%s",ae->rasmstruct[ae->irasmstruct-1].name,varbuffer);
 		curlabel.iw=-1;
 		/* legacy */
@@ -6821,7 +7035,7 @@ void PushLabel(struct s_assenv *ae)
 #endif
 			curlabel.iw=-1;
 			curlabel.local=1;
-			curlabelname=curlabel.name=MakeLocalLabel(ae,varbuffer,NULL);
+			curlabel.name=MakeLocalLabel(ae,varbuffer,NULL);  MemFree(varbuffer);
 			curlabel.crc=GetCRC(curlabel.name);
 
 			/* local labels ALSO set new reference */
@@ -6829,22 +7043,11 @@ void PushLabel(struct s_assenv *ae)
 //printf("push LOCAL is freeing lastgloballabel\n");
 				MemFree(ae->lastgloballabel);
 			}
-			ae->lastgloballabel=TxtStrDup(curlabelname);
-
-			/* pour les inceptions de macros */
-			if (ae->imacropos) {
-				for (im=ae->imacropos-1;im>=0;im--) {
-					if (ae->idx>=ae->macropos[im].start && ae->idx<ae->macropos[im].end) break;
-				}
-				if (im>=0) {
-					/* on met à jour le local/global en niveau de macro ??? */
-				}
-			}
-//printf("push LOCAL as reference [%d] for proximity label -> [%s]\n",im, ae->lastgloballabel);
-
-
+			ae->lastgloballabel=TxtStrDup(curlabel.name);
 			ae->lastgloballabellen=strlen(ae->lastgloballabel);
 			ae->lastglobalalloc=1;
+//printf("push LOCAL as reference [%d] for proximity label -> [%s]\n",im, ae->lastgloballabel);
+
 		} else {
 #if TRACE_LABEL
 	printf("PUSH GLOBAL or PROXIMITY\n");
@@ -6856,94 +7059,76 @@ void PushLabel(struct s_assenv *ae)
 						i=0;
 						do {
 							varbuffer[i]=varbuffer[i+1];
-							ae->wl[ae->idx].w[i]=ae->wl[ae->idx].w[i+1];
 							i++;
 						} while (varbuffer[i]!=0);
-						if (!touched) {
-							curlabel.iw=ae->idx;
-						} else {
-							curlabel.iw=-1;
-							curlabel.name=varbuffer;
-						}
-						curlabel.crc=GetCRC(varbuffer);
-						curlabelname=varbuffer;
+
+						curlabel.iw=-1;
+						curlabel.name=varbuffer;
+						curlabel.crc=GetCRC(curlabel.name);
 					} else {
 						/* proximity labels */
 						if (ae->lastgloballabel) {
-							curlabelname=MemMalloc(strlen(varbuffer)+1+ae->lastgloballabellen);
-							sprintf(curlabelname,"%s%s",ae->lastgloballabel,varbuffer);
+							curlabel.name=MemMalloc(strlen(varbuffer)+1+ae->lastgloballabellen);
+							sprintf(curlabel.name,"%s%s",ae->lastgloballabel,varbuffer);
 							MemFree(varbuffer);
-							touched=1; // cause realloc!
 							curlabel.iw=-1;
-							curlabel.name=varbuffer=curlabelname;
-							curlabel.crc=GetCRC(varbuffer);
+							curlabel.crc=GetCRC(curlabel.name);
 #if TRACE_LABEL
-printf("PUSH PROXIMITY label that may be exported [%s]->[%s]\n",ae->wl[ae->idx].w,varbuffer);
+printf("PUSH PROXIMITY label that may be exported [%s]->[%s]\n",ae->wl[ae->idx].w,curlabel.name);
 #endif
 						} else {
-							/* MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"cannot create proximity label [%s] as there is no previous global label\n",varbuffer);
-							return; */
 #if TRACE_LABEL
-printf("PUSH Orphan PROXIMITY label that cannot be exported [%s]->[%s]\n",ae->wl[ae->idx].w,varbuffer);
+printf("PUSH Orphan PROXIMITY label that cannot be exported [%s]->[%s]\n",ae->wl[ae->idx].w,curlabel.name);
 #endif
 
-							// not optimal but!
-							curlabelname=TxtStrDup(varbuffer);
-							MemFree(varbuffer);
-							touched=1; // cause realloc!
 							curlabel.iw=-1;
-							curlabel.name=varbuffer=curlabelname;
+							curlabel.name=varbuffer;
 							curlabel.crc=GetCRC(varbuffer);
 						}
 					}
 					break;
 				default:
 #if TRACE_LABEL
-	printf("PUSH => GLOBAL\n");
+	printf("PUSH => GLOBAL [%s]\n",varbuffer);
 #endif
-					if (!touched) {
-						curlabel.iw=ae->idx;
-					} else {
-						curlabel.iw=-1;
-						curlabel.name=varbuffer;
-					}
+					curlabel.iw=-1;
+					curlabel.name=varbuffer; 
 					curlabel.crc=GetCRC(varbuffer);
-					curlabelname=varbuffer;
+
 					/* global labels set new reference */
 					if (ae->lastglobalalloc) MemFree(ae->lastgloballabel);
-					ae->lastgloballabel=ae->wl[ae->idx].w;
-					//ae->lastsuperglobal=ae->wl[ae->idx].w;
-					ae->lastgloballabellen=strlen(ae->wl[ae->idx].w);
-					ae->lastglobalalloc=0;
-//printf("SET global label [%s] l=%d\n",ae->lastgloballabel,ae->lastgloballabellen);
+					ae->lastgloballabel=TxtStrDup(curlabel.name);
+					ae->lastgloballabellen=strlen(curlabel.name);
+					ae->lastglobalalloc=1;
 					break;
 			}
 
 
-			if (varbuffer[0]!='@' && ae->module && ae->modulen) {
-				curlabelname=MemMalloc(strlen(varbuffer)+ae->modulen+2);
-				strcpy(curlabelname,ae->module);
-				strcat(curlabelname,"_");
-				strcat(curlabelname,varbuffer);
-				varbuffer=curlabelname;
-				curlabel.crc=GetCRC(varbuffer);
-				/* cause realloc */
-				touched=1;
-				curlabel.iw=-1;
-				curlabel.name=varbuffer;
+			/* this stage varbuffer maybe already freed or used */
+			if (curlabel.name[0]!='@' && ae->module && ae->modulen) {
+				char *newlabelname;
+
+				newlabelname=MemMalloc(strlen(curlabel.name)+ae->modulen+2);
+				strcpy(newlabelname,ae->module);
+				strcat(newlabelname,"_");
+				strcat(newlabelname,curlabel.name);
+				MemFree(curlabel.name);
+				curlabel.name=newlabelname;
+				curlabel.crc=GetCRC(curlabel.name);
+				//curlabel.iw=-1; => deja mis depuis longtemps
 			}
 #if TRACE_LABEL
-	if (varbuffer[0]!='@') printf("PUSH => ADD MODULE [%s] => [%s]\n",ae->module?ae->module:"(null)",varbuffer);
+	if (curlabel.name[0]!='@') printf("PUSH => ADD MODULE [%s] => [%s]\n",ae->module?ae->module:"(null)",curlabel.name);
 	else printf("PUSH => NO MODULE for local label\n");
 #endif
 
 			/* contrôle dico uniquement avec des labels non locaux */
-			if (SearchDico(ae,curlabelname,curlabel.crc)) {
-				MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"cannot create label [%s] as there is already a variable with the same name\n",curlabelname);
+			if (SearchDico(ae,curlabel.name,curlabel.crc)) {
+				MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"cannot create label [%s] as there is already a variable with the same name\n",curlabel.name);
 				return;
 			}
-			if(SearchAlias(ae,curlabel.crc,curlabelname)!=-1) {
-				MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"cannot create label [%s] as there is already an alias with the same name\n",curlabelname);
+			if(SearchAlias(ae,curlabel.crc,curlabel.name)!=-1) {
+				MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"cannot create label [%s] as there is already an alias with the same name\n",curlabel.name);
 				return;
 			}
 		}
@@ -6953,11 +7138,11 @@ printf("PUSH Orphan PROXIMITY label that cannot be exported [%s]->[%s]\n",ae->wl
 		curlabel.lz=ae->lz;
 	}
 
-	if ((searched_label=SearchLabel(ae,curlabelname,curlabel.crc))!=NULL) {
-		MakeError(ae,GetCurrentFile(ae),GetExpLine(ae,0),"Duplicate label [%s] - previously defined in [%s:%d]\n",curlabelname,ae->filename[searched_label->fileidx],searched_label->fileline);
-		if (curlabel.iw==-1) MemFree(curlabelname);
+	if ((searched_label=SearchLabel(ae,curlabel.name,curlabel.crc))!=NULL) {
+		MakeError(ae,GetCurrentFile(ae),GetExpLine(ae,0),"Duplicate label [%s] - previously defined in [%s:%d]\n",curlabel.name,ae->filename[searched_label->fileidx],searched_label->fileline);
+		MemFree(curlabel.name);
 	} else {
-//printf("PushLabel(%s) name=%s crc=%X\n",curlabelname,curlabel.name?curlabel.name:"null",curlabel.crc);
+//printf("PushLabel(%s) name=%s crc=%X lz=%d\n",curlabel.name,curlabel.name?curlabel.name:"null",curlabel.crc,curlabel.lz);
 		curlabel.fileidx=ae->wl[ae->idx].ifile;
 		curlabel.fileline=ae->wl[ae->idx].l;
 		curlabel.autorise_export=ae->autorise_export;
@@ -6966,7 +7151,6 @@ printf("PUSH Orphan PROXIMITY label that cannot be exported [%s]->[%s]\n",ae->wl
 		InsertLabelToTree(ae,&curlabel);
 	}
 
-	if (!touched) MemFree(varbuffer);
 }
 
 
@@ -6975,12 +7159,14 @@ unsigned char *EncodeSnapshotRLE(unsigned char *memin, int *lenout) {
 	#define FUNC "EncodeSnapshotRLE"
 	
 	int i,cpt,idx=0;
-	unsigned char *memout=NULL;
+	unsigned char *memout;
 	
-	memout=MemMalloc(65540);
+	memout=MemMalloc(65536*2);
 	
 	for (i=0;i<65536;) {
-		for (cpt=1;cpt<255;cpt++) if (memin[i]!=memin[i+cpt]) break;
+
+		for (cpt=1;cpt<255 && i+cpt<65536;cpt++) if (memin[i]!=memin[i+cpt]) break;
+
 		if (cpt>=3 || memin[i]==0xE5) {
 			memout[idx++]=0xE5;
 			memout[idx++]=cpt;
@@ -9394,6 +9580,45 @@ void _STR(struct s_assenv *ae) {
 	}
 }
 
+/* Microsoft IEEE-754 40bits float value */
+void _DEFF(struct s_assenv *ae) {
+	if (!ae->wl[ae->idx].t) {
+		do {
+			ae->idx++;
+			PushExpression(ae,ae->idx,E_EXPRESSION_0VRMike);
+		} while (ae->wl[ae->idx].t==0);
+	} else {
+		if (ae->getstruct) {
+			___output(ae,0);___output(ae,0);___output(ae,0);___output(ae,0);___output(ae,0);
+		} else {
+			MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"DEFF needs one or more parameters\n");
+		}
+	}
+}
+void _DEFF_struct(struct s_assenv *ae) {
+	unsigned char *rc;
+	double v;
+	if (!ae->wl[ae->idx].t) {
+		do {
+			ae->idx++;
+			/* conversion des symboles connus */
+			ExpressionFastTranslate(ae,&ae->wl[ae->idx].w,0);
+			/* calcul de la valeur définitive de l'expression */
+			v=ComputeExpressionCore(ae,ae->wl[ae->idx].w,ae->outputadr,0);
+			/* conversion en réel Amsdos */
+			rc=__internal_MakeRosoftREAL(ae,v,0);
+			___output(ae,rc[0]);___output(ae,rc[1]);___output(ae,rc[2]);___output(ae,rc[3]);___output(ae,rc[4]);			
+		} while (ae->wl[ae->idx].t==0);
+	} else {
+		if (ae->getstruct) {
+			___output(ae,0);___output(ae,0);___output(ae,0);___output(ae,0);___output(ae,0);
+		} else {
+			MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"DEFF needs one or more parameters\n");
+		}
+	}
+}
+
+
 void _DEFR(struct s_assenv *ae) {
 	if (!ae->wl[ae->idx].t) {
 		do {
@@ -9824,13 +10049,13 @@ void __LZAPU(struct s_assenv *ae) {
 		return;
 	}
 	#ifdef NO_3RD_PARTIES
-		MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"Cannot use 3rd parties cruncher with this version of RASM\n",GetCurrentFile(ae),ae->wl[ae->idx].l);
+		MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"Cannot use 3rd parties cruncher with this version of RASM\n");
 		FreeAssenv(ae);
 		exit(-5);
 	#endif
 	
-	if (ae->lz>=0 && ae->lz<ae->ilz) {
-		MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"Cannot start a new LZ section inside another one (%d)\n",GetCurrentFile(ae),ae->wl[ae->idx].l,ae->lz);
+	if (ae->lz>=0 && ae->lz<ae->ilz && ae->lzsection[ae->ilz-1].lzversion) {
+		MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"Cannot start a new LZ section inside another one (%d)\n",ae->lz);
 		FreeAssenv(ae);
 		exit(-5);
 	}
@@ -9851,13 +10076,13 @@ void __LZ4(struct s_assenv *ae) {
 		return;
 	}
 	#ifdef NO_3RD_PARTIES
-		MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"Cannot use 3rd parties cruncher with this version of RASM\n",GetCurrentFile(ae),ae->wl[ae->idx].l);
+		MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"Cannot use 3rd parties cruncher with this version of RASM\n");
 		FreeAssenv(ae);
 		exit(-5);
 	#endif
 	
-	if (ae->lz>=0 && ae->lz<ae->ilz) {
-		MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"Cannot start a new LZ section inside another one (%d)\n",GetCurrentFile(ae),ae->wl[ae->idx].l,ae->lz);
+	if (ae->lz>=0 && ae->lz<ae->ilz && ae->lzsection[ae->ilz-1].lzversion) {
+		MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"Cannot start a new LZ section inside another one (%d)\n",ae->lz);
 		FreeAssenv(ae);
 		exit(-5);
 	}
@@ -9878,13 +10103,13 @@ void __LZX7(struct s_assenv *ae) {
 		return;
 	}
 	#ifdef NO_3RD_PARTIES
-		MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"Cannot use 3rd parties cruncher with this version of RASM\n",GetCurrentFile(ae),ae->wl[ae->idx].l);
+		MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"Cannot use 3rd parties cruncher with this version of RASM\n");
 		FreeAssenv(ae);
 		exit(-5);
 	#endif
 	
-	if (ae->lz>=0 && ae->lz<ae->ilz) {
-		MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"Cannot start a new LZ section inside another one (%d)\n",GetCurrentFile(ae),ae->wl[ae->idx].l,ae->lz);
+	if (ae->lz>=0 && ae->lz<ae->ilz && ae->lzsection[ae->ilz-1].lzversion) {
+		MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"Cannot start a new LZ section inside another one (%d)\n",ae->lz);
 		FreeAssenv(ae);
 		exit(-5);
 	}
@@ -9905,13 +10130,13 @@ void __LZEXO(struct s_assenv *ae) {
 		return;
 	}
 	#ifdef NO_3RD_PARTIES
-		MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"Cannot use 3rd parties cruncher with this version of RASM\n",GetCurrentFile(ae),ae->wl[ae->idx].l);
+		MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"Cannot use 3rd parties cruncher with this version of RASM\n");
 		FreeAssenv(ae);
 		exit(-5);
 	#endif
 	
-	if (ae->lz>=0 && ae->lz<ae->ilz) {
-		MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"Cannot start a new LZ section inside another one (%d)\n",GetCurrentFile(ae),ae->wl[ae->idx].l,ae->lz);
+	if (ae->lz>=0 && ae->lz<ae->ilz && ae->lzsection[ae->ilz-1].lzversion) {
+		MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"Cannot start a new LZ section inside another one (%d)\n",ae->lz);
 		FreeAssenv(ae);
 		exit(-5);
 	}
@@ -9931,8 +10156,8 @@ void __LZ48(struct s_assenv *ae) {
 		MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"LZ directive does not need any parameter\n");
 		return;
 	}
-	if (ae->lz>=0 && ae->lz<ae->ilz) {
-		MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"Cannot start a new LZ section inside another one (%d)\n",GetCurrentFile(ae),ae->wl[ae->idx].l,ae->lz);
+	if (ae->lz>=0 && ae->lz<ae->ilz && ae->lzsection[ae->ilz-1].lzversion) {
+		MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"Cannot start a new LZ section inside another one (%d)\n",ae->lz);
 		FreeAssenv(ae);
 		exit(-5);
 	}
@@ -9952,8 +10177,8 @@ void __LZ49(struct s_assenv *ae) {
 		MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"LZ directive does not need any parameter\n");
 		return;
 	}
-	if (ae->lz>=0 && ae->lz<ae->ilz) {
-		MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"Cannot start a new LZ section inside another one (%d)\n",GetCurrentFile(ae),ae->wl[ae->idx].l,ae->lz);
+	if (ae->lz>=0 && ae->lz<ae->ilz && ae->lzsection[ae->ilz-1].lzversion) {
+		MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"Cannot start a new LZ section inside another one (%d)\n",ae->lz);
 		FreeAssenv(ae);
 		exit(-5);
 	}
@@ -9968,6 +10193,8 @@ void __LZ49(struct s_assenv *ae) {
 	ObjectArrayAddDynamicValueConcat((void**)&ae->lzsection,&ae->ilz,&ae->mlz,&curlz,sizeof(curlz));
 }
 void __LZCLOSE(struct s_assenv *ae) {
+	struct s_lz_section curlz;
+
 	if (!ae->ilz || ae->lz==-1) {
 		MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"Cannot close LZ section as it wasn't opened\n");
 		return;
@@ -9976,8 +10203,17 @@ void __LZCLOSE(struct s_assenv *ae) {
 	ae->lzsection[ae->ilz-1].memend=ae->outputadr;
 	ae->lzsection[ae->ilz-1].ilabel=ae->il;
 	ae->lzsection[ae->ilz-1].iexpr=ae->ie;
-	//ae->lz=ae->ilz;
-	ae->lz=-1;
+	// commentaire
+	curlz.iw=ae->idx;
+	curlz.iorgzone=ae->io-1;
+	curlz.ibank=ae->activebank;
+	curlz.memstart=ae->outputadr;
+	curlz.memend=-1;
+	curlz.lzversion=0; // intermediate zone
+	ae->lz=ae->ilz;
+	ObjectArrayAddDynamicValueConcat((void**)&ae->lzsection,&ae->ilz,&ae->mlz,&curlz,sizeof(curlz));
+
+	//ae->lz=-1;
 }
 
 void __LIMIT(struct s_assenv *ae) {
@@ -10050,6 +10286,7 @@ void ___new_memory_space(struct s_assenv *ae)
 	orgzone.memstart=0;
 	orgzone.ibank=ae->activebank;
 	orgzone.nocode=ae->nocode=0;
+	orgzone.inplace=1;
 	ObjectArrayAddDynamicValueConcat((void**)&ae->orgzone,&ae->io,&ae->mo,&orgzone,sizeof(orgzone));
 
 	OverWriteCheck(ae);
@@ -10361,6 +10598,7 @@ void PopGlobal(struct s_assenv *ae) {
 #if TRACE_LABEL
 printf("<== PopGlobal on Stack [%s] igs=%d\n",ae->globalstack[ae->igs],ae->igs+1);
 #endif
+		if (ae->lastglobalalloc) MemFree(ae->lastgloballabel);
 
 		if (ae->globalstack[ae->igs]) {
 			ae->lastgloballabel=TxtStrDup(ae->globalstack[ae->igs]);
@@ -10369,7 +10607,7 @@ printf("<== PopGlobal on Stack [%s] igs=%d\n",ae->globalstack[ae->igs],ae->igs+1
 		} else {
 			ae->lastgloballabel=NULL;
 			ae->lastgloballabellen=0;
-			ae->lastglobalalloc=1;
+			ae->lastglobalalloc=0;
 		}
 
 		if (ae->globalstack[ae->igs]) MemFree(ae->globalstack[ae->igs]);
@@ -10457,7 +10695,7 @@ void __MACRO(struct s_assenv *ae) {
 		if (ae->wl[idx].t==2) idx--;
 		ae->idx=idx;
 	} else {
-		MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"MACRO definition need at least one parameter\n");
+		MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"MACRO definition need at least one parameter for the name of the macro\n");
 	}
 }
 
@@ -10616,6 +10854,7 @@ struct s_wordlist *__MACRO_EXECUTE(struct s_assenv *ae, int imacro) {
 							if (ae->wl[j].w[lm]=='{') touched++; else if (ae->wl[j].w[lm]=='}') touched--; else if (touched) ae->wl[j].w[lm]=toupper(ae->wl[j].w[lm]);
 						}
 					}
+//printf("MACRO_EXECUTE word[%d]=[%s] param[%d]=[%s] cpybackup[%d]=[%s]\n",j,ae->wl[j].w,i,ae->macro[imacro].param[i],i,cpybackup[i].w);
 					ae->wl[j].w=TxtReplace(ae->wl[j].w,ae->macro[imacro].param[i],cpybackup[i].w,0);
 				}
 				MemFree(cpybackup[i].w);
@@ -11727,11 +11966,11 @@ void __PROTECT(struct s_assenv *ae) {
 }
 
 void ___org_close(struct s_assenv *ae) {
-	if (ae->lz>=0) {
+	__internal_UpdateLZBlockIfAny(ae);
+	if (ae->lz>=0 && ae->lzsection[ae->ilz-1].lzversion) {
 		MakeError(ae,GetCurrentFile(ae),ae->wl[ae->idx].l,"Cannot ORG inside a LZ section\n");
 		return;
 	}
-	__internal_UpdateLZBlockIfAny(ae);
 	/* close current ORG */
 	if (ae->io) {
 		ae->orgzone[ae->io-1].memend=ae->outputadr;
@@ -11798,6 +12037,8 @@ void __ORG(struct s_assenv *ae) {
 	}
 	
 	___org_new(ae,ae->nocode);
+
+	if (ae->outputadr==ae->codeadr) ae->orgzone[ae->io-1].inplace=1;
 }
 void __NOCODE(struct s_assenv *ae) {
 	if (ae->wl[ae->idx].t==1) {
@@ -11869,6 +12110,7 @@ void __STRUCT(struct s_assenv *ae) {
 					instruction[ICRC_DEFB].makemnemo=_DEFB_struct;instruction[ICRC_DB].makemnemo=_DEFB_struct;
 					instruction[ICRC_DEFW].makemnemo=_DEFW_struct;instruction[ICRC_DW].makemnemo=_DEFW_struct;
 					instruction[ICRC_DEFI].makemnemo=_DEFI_struct;
+					instruction[ICRC_DEFF].makemnemo=_DEFF_struct;instruction[ICRC_DF].makemnemo=_DEFF_struct;
 					instruction[ICRC_DEFR].makemnemo=_DEFR_struct;instruction[ICRC_DR].makemnemo=_DEFR_struct;
 					instruction[ICRC_DEFS].makemnemo=_DEFS_struct;instruction[ICRC_DS].makemnemo=_DEFS_struct;
 				}
@@ -12113,7 +12355,7 @@ void __ENDSTRUCT(struct s_assenv *ae) {
 #if TRACE_STRUCT
 	printf("unwrap data capture\n");
 #endif
-			if (ae->as80==1) {/* not for UZ80 */
+			if (ae->as80==1 || ae->pasmo) {/* not for UZ80 */
 				instruction[ICRC_DEFB].makemnemo=_DEFB_as80;instruction[ICRC_DB].makemnemo=_DEFB_as80;
 				instruction[ICRC_DEFW].makemnemo=_DEFW_as80;instruction[ICRC_DW].makemnemo=_DEFW_as80;
 				instruction[ICRC_DEFI].makemnemo=_DEFI_as80;
@@ -12122,6 +12364,7 @@ void __ENDSTRUCT(struct s_assenv *ae) {
 				instruction[ICRC_DEFW].makemnemo=_DEFW;instruction[ICRC_DW].makemnemo=_DEFW;
 				instruction[ICRC_DEFI].makemnemo=_DEFI;
 			}
+			instruction[ICRC_DEFF].makemnemo=_DEFF;instruction[ICRC_DF].makemnemo=_DEFF;
 			instruction[ICRC_DEFR].makemnemo=_DEFR;instruction[ICRC_DR].makemnemo=_DEFR;
 			instruction[ICRC_DEFS].makemnemo=_DEFS;instruction[ICRC_DS].makemnemo=_DEFS;
 
@@ -12439,6 +12682,19 @@ printf("nbsample=%d (sze=%d,chn=%d,bps=%d) st=%c\n",nbsample,controlsize,nbchann
 	}
 }
 
+
+#ifdef NOAPULTRA
+  int APULTRA_crunch(unsigned char *input_data,int input_size,unsigned char **lzdata,int *lzlen) {
+	  lzdata=MemMalloc(4);
+	  *lzlen=0;
+
+printf("no AP-Ultra support in this version!\n");
+fprintf(stderr,"no AP-Ultra support in this version!\n");
+
+	  return 0;
+  }
+#endif
+
 /*
 	meta fonction qui gère le INCBIN standard plus les variantes SMP et DMA
 */
@@ -12695,7 +12951,7 @@ printf("Hexbin -> surprise! we found the file!\n");
 						MemFree(curhexbin->data);
 						curhexbin->data=newdata;
 						#if TRACE_PREPRO
-						rasm_printf(ae,KVERBOSE"crunched with Exomizer into %d byte(s)\n",curhexbin->datalen);
+						rasm_printf(ae,KVERBOSE"crunched with AP-Ultra into %d byte(s)\n",curhexbin->datalen);
 						#endif
 						break;
 					#endif
@@ -12907,7 +13163,7 @@ printf("Hexbin -> re-tiling MAP! width=%d\n",width);
 								MemFree(curhexbin->data);
 								curhexbin->data=newdata;
 								#if TRACE_PREPRO
-								rasm_printf(ae,KVERBOSE"crunched with Exomizer into %d byte(s)\n",curhexbin->datalen);
+								rasm_printf(ae,KVERBOSE"crunched with AP-Ultra into %d byte(s)\n",curhexbin->datalen);
 								#endif
 								break;
 							#endif
@@ -13119,9 +13375,11 @@ struct s_asm_keyword instruction[]={
 {"DI",0,_DI},
 {"EI",0,_EI},
 {"NOP",0,_NOP},
+{"DEFF",0,_DEFF},
 {"DEFR",0,_DEFR},
 {"DEFB",0,_DEFB},
 {"DEFM",0,_DEFB},
+{"DF",0,_DEFF},
 {"DR",0,_DEFR},
 {"DM",0,_DEFB},
 {"DB",0,_DEFB},
@@ -13237,6 +13495,18 @@ struct s_asm_keyword instruction[]={
 {"",0,NULL}
 };
 
+int IsDirective(char *zeexpression)
+{
+	int i,crc;
+
+	crc=GetCRC(zeexpression);
+
+	for (i=0;instruction[i].mnemo[0];i++) if (instruction[i].crc=crc && !strcmp(instruction[i].mnemo,zeexpression)) return 1;
+
+	return 0;
+}
+
+
 int Assemble(struct s_assenv *ae, unsigned char **dataout, int *lenout, struct s_rasm_info **debug)
 {
 	#undef FUNC
@@ -13253,7 +13523,7 @@ int Assemble(struct s_assenv *ae, unsigned char **dataout, int *lenout, struct s
 	size_t slzlen;
 	unsigned char *input_data;
 	struct s_orgzone orgzone={0};
-	int iorgzone,ibank,offset,endoffset;
+	int iorgzone,ibank,offset,endoffset,morgzone,saveorgzone;
 	int il,maxrom;
 	char *TMP_filename=NULL;
 	int minmem=65536,maxmem=0,lzmove;
@@ -13284,6 +13554,7 @@ printf("*** assembling ***\n");
 	
 	/* default orgzone */
 	orgzone.ibank=BANK_MAX_NUMBER;
+	orgzone.inplace=1;
 	ObjectArrayAddDynamicValueConcat((void**)&ae->orgzone,&ae->io,&ae->mo,&orgzone,sizeof(orgzone));
 	___output=___internal_output;
 	/* init des automates */
@@ -13415,7 +13686,7 @@ printf("*** assembling ***\n");
 	for (icrc=0;instruction[icrc].mnemo[0];icrc++) instruction[icrc].crc=GetCRC(instruction[icrc].mnemo);
 	for (icrc=0;math_keyword[icrc].mnemo[0];icrc++) math_keyword[icrc].crc=GetCRC(math_keyword[icrc].mnemo);
 
-	if (ae->as80==1) { /* not for UZ80 */
+	if (ae->as80==1 || ae->pasmo) { /* not for UZ80 */
 		for (icrc=0;instruction[icrc].mnemo[0];icrc++) {
 			if (strcmp(instruction[icrc].mnemo,"DEFB")==0 || strcmp(instruction[icrc].mnemo,"DB")==0) {
 				instruction[icrc].makemnemo=_DEFB_as80;
@@ -13437,6 +13708,10 @@ printf("*** assembling ***\n");
 			ICRC_DEFW=icrc;
 		} else if (strcmp(instruction[icrc].mnemo,"DW")==0) {
 			ICRC_DW=icrc;
+		} else if (strcmp(instruction[icrc].mnemo,"DEFF")==0) {
+			ICRC_DEFF=icrc;
+		} else if (strcmp(instruction[icrc].mnemo,"DF")==0) {
+			ICRC_DF=icrc;
 		} else if (strcmp(instruction[icrc].mnemo,"DEFR")==0) {
 			ICRC_DEFR=icrc;
 		} else if (strcmp(instruction[icrc].mnemo,"DR")==0) {
@@ -13732,101 +14007,177 @@ printf("crunch if any\n");
 	***************************************************/
 	if (!ae->stop || !ae->nberr) {
 		for (i=0;i<ae->ilz;i++) {
-			/* compute labels and expression inside crunched blocks */
-			PopAllExpression(ae,i);
-			
-			ae->curlz=i;
-			iorgzone=ae->lzsection[i].iorgzone;
-			ibank=ae->lzsection[i].ibank;
-			input_data=&ae->mem[ae->lzsection[i].ibank][ae->lzsection[i].memstart];
-			input_size=ae->lzsection[i].memend-ae->lzsection[i].memstart;
-//printf("grouik (%d) %s\n",ae->lzsection[i].lzversion,ae->lzsection[i].lzversion==8?"mizou":"");
-			if (!input_size) {
-				rasm_printf(ae,KWARNING"[%s:%d] Warning: crunched section is empty\n",GetCurrentFile(ae),ae->wl[ae->idx].l);
-				if (ae->erronwarn) MaxError(ae);
-			} else {
-				switch (ae->lzsection[i].lzversion) {
-					case 7:
-						#ifndef NO_3RD_PARTIES
-						lzdata=ZX7_compress(optimize(input_data, input_size), input_data, input_size, &slzlen);
-						lzlen=slzlen;
-						#endif
-						break;
-					case 4:
-						#ifndef NO_3RD_PARTIES
-						lzdata=LZ4_crunch(input_data,input_size,&lzlen);
-						#endif
-						break;
-					case 8:
-						#ifndef NO_3RD_PARTIES
-						if (input_size>=1024) rasm_printf(ae,KWARNING"Exomizer is crunching %.1fkb this may take a while, be patient...\n",input_size/1024.0);
-						lzdata=Exomizer_crunch(input_data,input_size,&lzlen);
-						#endif
-						break;
-					case 17:
-						#ifndef NO_3RD_PARTIES
-						if (input_size>=1024) rasm_printf(ae,KWARNING"AP-Ultra is crunching %.1fkb this may take a while, be patient...\n",input_size/1024.0);
-						APULTRA_crunch(input_data,input_size,&lzdata,&lzlen);
-						#endif
-						break;
-					case 48:
-						lzdata=LZ48_crunch(input_data,input_size,&lzlen);
-						break;
-					case 49:
-						lzdata=LZ49_crunch(input_data,input_size,&lzlen);
-						break;
-					default:
-						rasm_printf(ae,"Internal error - unknown crunch method %d\n",ae->lzsection[i].lzversion);
-						exit(-12);
+			/* on dépile les symboles dans l'ordre mais on ne reloge pas sur les zones intermédiaires ou post-crunched */	
+			if (ae->lzsection[i].lzversion!=0) {
+#if TRACE_ASSEMBLE
+printf("Crunch LZ[%d] (%d) %s\n",i,ae->lzsection[i].lzversion,ae->lzsection[i].lzversion==8?"mizou":"");
+#endif
+				/* compute labels and expression inside crunched blocks */
+				PopAllExpression(ae,i);
+
+				ae->curlz=i;
+				iorgzone=ae->lzsection[i].iorgzone;
+				ibank=ae->lzsection[i].ibank;
+				input_data=&ae->mem[ae->lzsection[i].ibank][ae->lzsection[i].memstart];
+				input_size=ae->lzsection[i].memend-ae->lzsection[i].memstart;
+				if (!input_size) {
+					rasm_printf(ae,KWARNING"[%s:%d] Warning: crunched section is empty\n",GetCurrentFile(ae),ae->wl[ae->idx].l);
+					if (ae->erronwarn) MaxError(ae);
+				} else {
+					switch (ae->lzsection[i].lzversion) {
+						case 7:
+							#ifndef NO_3RD_PARTIES
+							lzdata=ZX7_compress(optimize(input_data, input_size), input_data, input_size, &slzlen);
+							lzlen=slzlen;
+							#endif
+							break;
+						case 4:
+							#ifndef NO_3RD_PARTIES
+							lzdata=LZ4_crunch(input_data,input_size,&lzlen);
+							#endif
+							break;
+						case 8:
+							#ifndef NO_3RD_PARTIES
+							if (input_size>=1024) rasm_printf(ae,KWARNING"Exomizer is crunching %.1fkb this may take a while, be patient...\n",input_size/1024.0);
+							lzdata=Exomizer_crunch(input_data,input_size,&lzlen);
+							#endif
+							break;
+						case 17:
+							#ifndef NO_3RD_PARTIES
+							if (input_size>=1024) rasm_printf(ae,KWARNING"AP-Ultra is crunching %.1fkb this may take a while, be patient...\n",input_size/1024.0);
+							APULTRA_crunch(input_data,input_size,&lzdata,&lzlen);
+							#endif
+							break;
+						case 48:
+							lzdata=LZ48_crunch(input_data,input_size,&lzlen);
+							break;
+						case 49:
+							lzdata=LZ49_crunch(input_data,input_size,&lzlen);
+							break;
+						default:
+							rasm_printf(ae,"Internal error - unknown crunch method %d\n",ae->lzsection[i].lzversion);
+							exit(-12);
+					}
+				}
+
+#if TRACE_ASSEMBLE
+				printf("lzsection[%d] type=%d start=%04X end=%04X crunched size=%d\n",i,ae->lzsection[i].lzversion,ae->lzsection[i].memstart,ae->lzsection[i].memend,lzlen);
+#endif
+
+				if (input_size<lzlen) {
+					//MakeError(ae,ae->filename[ae->wl[ae->lzsection[i].iw].ifile],ae->wl[ae->lzsection[i].iw].l,"As the LZ section cannot crunch data, Rasm may not guarantee assembled file!\n");
+					rasm_printf(ae,KWARNING"Warning: LZ section is bigger than original\n");
+					if (ae->erronwarn) MaxError(ae);
+				}
+
+				lzshift=lzlen-(ae->lzsection[i].memend-ae->lzsection[i].memstart);
+#if TRACE_ASSEMBLE
+printf("lzshift=%d\n",lzshift);
+#endif
+
+				/*******************************************************************************
+				  r e l o c a t e   d a t a   u n t i l   n o n   c o n t i g u o u s   O R G
+				*******************************************************************************/
+				if (lzshift>0) {
+					/* positif => plus gros @@TODO */
+					//MemMove(ae->mem[ae->lzsection[i].ibank]+ae->lzsection[i].memend+lzshift,ae->mem[ae->lzsection[i].ibank]+ae->lzsection[i].memend,65536-ae->lzsection[i].memend-lzshift);
+				} else if (lzshift<0) {
+					/* when crunched we may have to move more than 1 ORG */
+					morgzone=iorgzone;
+					while (morgzone+1<ae->io) {
+						/* if next ORG zone is contiguous */
+						if (ae->orgzone[morgzone+1].memstart==ae->orgzone[morgzone].memend && ae->orgzone[morgzone+1].ibank==ae->orgzone[morgzone].ibank) {
+							morgzone++;
+						} else break;
+					}
+					lzmove=ae->orgzone[morgzone].memend-ae->lzsection[i].memend;
+#if TRACE_ASSEMBLE
+printf("include %d other ORG for the memove size=%d\n",morgzone-iorgzone,lzmove);
+#endif
+					if (lzmove) {
+						MemMove(ae->mem[ae->lzsection[i].ibank]+ae->lzsection[i].memend+lzshift,ae->mem[ae->lzsection[i].ibank]+ae->lzsection[i].memend,lzmove);
+					}
+				}
+				memcpy(ae->mem[ae->lzsection[i].ibank]+ae->lzsection[i].memstart,lzdata,lzlen);
+				MemFree(lzdata);
+				/*******************************************************************
+				  l a b e l    a n d    e x p r e s s i o n    r e l o c a t i o n
+				*******************************************************************/
+				/* relocate labels in the same ORG zone AND contiguous ORG when they are "in place" */
+				il=ae->lzsection[i].ilabel;
+				saveorgzone=iorgzone;
+				do {
+					while (il<ae->il && ae->label[il].iorgzone<iorgzone) il++;
+
+					while (il<ae->il && ae->label[il].iorgzone==iorgzone) {
+						curlabel=SearchLabel(ae,ae->label[il].iw!=-1?wordlist[ae->label[il].iw].w:ae->label[il].name,ae->label[il].crc);
+						/* CANNOT be NULL */
+						curlabel->ptr+=lzshift;
+#if TRACE_ASSEMBLE
+	printf("label [%s] shifte de %d valeur #%04X -> #%04X\n",curlabel->iw!=-1?wordlist[curlabel->iw].w:curlabel->name,lzshift,curlabel->ptr-lzshift,curlabel->ptr);
+#endif
+						il++;
+					}
+					iorgzone++;
+					/* jump over contiguous ORG not "in place" */
+					while (iorgzone<ae->io && !ae->orgzone[iorgzone].inplace && iorgzone<=morgzone) {
+						//printf("label reallocation jump over ORG %d\n",iorgzone);
+						iorgzone++;
+					}
+				} while (iorgzone<=morgzone);
+
+				/* relocate expressions in the same ORG zone AND contiguous ORG */
+				iorgzone=saveorgzone;
+				il=ae->lzsection[i].iexpr;
+				do {
+					while (il<ae->il && ae->label[il].iorgzone<iorgzone) il++;
+
+					while (il<ae->ie && ae->expression[il].iorgzone==iorgzone) {
+						ae->expression[il].wptr+=lzshift;
+						/* relocate only "in place" contiguous ORG */
+						if (ae->orgzone[iorgzone].inplace) ae->expression[il].ptr+=lzshift;
+#if TRACE_ASSEMBLE
+	printf("expression [%s] shiftee ptr(%s)=#%04X wptr=#%04X\n", ae->expression[il].reference?ae->expression[il].reference:wordlist[ae->expression[il].iw].w, ae->orgzone[iorgzone].inplace?"relocated":"untouched",ae->expression[il].ptr, ae->expression[il].wptr);
+#endif
+						il++;
+					}
+					iorgzone++;
+				} while (iorgzone<=morgzone);
+
+				/* relocate crunched sections in the same ORG zone AND contiguous ORG */
+				iorgzone=saveorgzone;
+				il=i+1;
+				do {
+					while (il<ae->ilz && ae->lzsection[il].iorgzone==iorgzone && ae->lzsection[il].ibank==ibank) {
+
+#if TRACE_ASSEMBLE
+	rasm_printf(ae,"reloger lzsection[%d] O%d B%d shift=%d\n",il,ae->lzsection[il].iorgzone,ae->lzsection[il].ibank,lzshift);
+#endif
+						ae->lzsection[il].memstart+=lzshift;
+						ae->lzsection[il].memend+=lzshift;
+						il++;
+					}
+					iorgzone++;
+				} while (iorgzone<=morgzone);
+
+				iorgzone=saveorgzone;
+				/* relocate ORG zone(s) */
+				ae->orgzone[iorgzone].memend+=lzshift;
+				while (iorgzone<morgzone) {
+					iorgzone++;
+					ae->orgzone[iorgzone].memstart+=lzshift;
+					ae->orgzone[iorgzone].memend+=lzshift;
 				}
 			}
-			//rasm_printf(ae,"lzsection[%d] type=%d start=%04X end=%04X crunched size=%d\n",i,ae->lzsection[i].lzversion,ae->lzsection[i].memstart,ae->lzsection[i].memend,lzlen);
-
-			if (input_size<lzlen) {
-				MakeError(ae,ae->filename[ae->wl[ae->lzsection[i].iw].ifile],ae->wl[ae->lzsection[i].iw].l,"As the LZ section cannot crunch data, Rasm may not guarantee assembled file!\n");
+		}
+		for (i=0;i<ae->ilz;i++) {
+			if (ae->lzsection[i].lzversion==0) {
+#if TRACE_ASSEMBLE
+//printf("PopAllExpr on intermediate section[%d] (%d) %s\n",i,ae->lzsection[i].lzversion,ae->lzsection[i].lzversion==8?"mizou":"");
+#endif
+				/* compute labels and expression outside crunched blocks BUT after crunched */
+				PopAllExpression(ae,i);
 			}
-
-			lzshift=lzlen-(ae->lzsection[i].memend-ae->lzsection[i].memstart);
-			if (lzshift>0) {
-				MemMove(ae->mem[ae->lzsection[i].ibank]+ae->lzsection[i].memend+lzshift,ae->mem[ae->lzsection[i].ibank]+ae->lzsection[i].memend,65536-ae->lzsection[i].memend-lzshift);
-			} else if (lzshift<0) {
-				lzmove=ae->orgzone[iorgzone].memend-ae->lzsection[i].memend;
-				if (lzmove) {
-					MemMove(ae->mem[ae->lzsection[i].ibank]+ae->lzsection[i].memend+lzshift,ae->mem[ae->lzsection[i].ibank]+ae->lzsection[i].memend,lzmove);
-				}
-			}
-			memcpy(ae->mem[ae->lzsection[i].ibank]+ae->lzsection[i].memstart,lzdata,lzlen);
-			MemFree(lzdata);
-			/*******************************************************************
-			  l a b e l    a n d    e x p r e s s i o n    r e l o c a t i o n
-			*******************************************************************/
-			/* relocate labels in the same ORG zone AND after the current crunched section */
-			il=ae->lzsection[i].ilabel;
-			while (il<ae->il && ae->label[il].iorgzone==iorgzone && ae->label[il].ibank==ibank) {
-				curlabel=SearchLabel(ae,ae->label[il].iw!=-1?wordlist[ae->label[il].iw].w:ae->label[il].name,ae->label[il].crc);
-				/* CANNOT be NULL */
-				curlabel->ptr+=lzshift;
-				//printf("label [%s] shifte de %d valeur #%04X -> #%04X\n",curlabel->iw!=-1?wordlist[curlabel->iw].w:curlabel->name,lzshift,curlabel->ptr-lzshift,curlabel->ptr);
-				il++;
-			}
-			/* relocate expressions in the same ORG zone AND after the current crunched section */
-			il=ae->lzsection[i].iexpr;
-			while (il<ae->ie && ae->expression[il].iorgzone==iorgzone && ae->expression[il].ibank==ibank) {
-				ae->expression[il].wptr+=lzshift;
-				ae->expression[il].ptr+=lzshift;
-				//printf("expression [%s] shiftee ptr=#%04X wptr=#%04X\n", ae->expression[il].reference?ae->expression[il].reference:wordlist[ae->expression[il].iw].w, ae->expression[il].ptr, ae->expression[il].wptr);
-				il++;
-			}
-			/* relocate crunched sections in the same ORG zone AND after the current crunched section */
-			il=i+1;
-			while (il<ae->ilz && ae->lzsection[il].iorgzone==iorgzone && ae->lzsection[il].ibank==ibank) {
-				//rasm_printf(ae,"reloger lzsection[%d] O%d B%d\n",il,ae->lzsection[il].iorgzone,ae->lzsection[il].ibank);
-				ae->lzsection[il].memstart+=lzshift;
-				ae->lzsection[il].memend+=lzshift;
-				il++;
-			}
-			/* relocate current ORG zone */
-			ae->orgzone[iorgzone].memend+=lzshift;
 		}
 		if (ae->ilz) {
 			/* compute expression placed after the last crunched block */
@@ -14836,16 +15187,18 @@ void EarlyPrepSrc(struct s_assenv *ae, char **listing, char *filename) {
 	while (l>=0) {
 		/* patch merge line with '\' only outside quotes */
 		idx=strlen(listing[l])-1;
+		
+		if (idx>0) {
+			while (idx && (listing[l][idx]==' ' || listing[l][idx]==0x0D || listing[l][idx]==0x0A || listing[l][idx]==0x0B)) {
+				idx--;
+			}
 
-		while (idx && (listing[l][idx]==' ' || listing[l][idx]==0x0D || listing[l][idx]==0x0A || listing[l][idx]==0x0B)) {
-			idx--;
-		}
-
-		if (listing[l][idx]=='\\') {
-			/* fusion avec la ligne suivante qui est obligatoirement présente */
-			listing[l]=MemRealloc(listing[l],strlen(listing[l])+strlen(listing[l+1])+1);
-			strcpy(listing[l]+idx,listing[l+1]);
-			strcpy(listing[l+1],"");
+			if (listing[l][idx]=='\\') {
+				/* fusion avec la ligne suivante qui est obligatoirement présente */
+				listing[l]=MemRealloc(listing[l],strlen(listing[l])+strlen(listing[l+1])+1);
+				strcpy(listing[l]+idx,listing[l+1]);
+				strcpy(listing[l+1],"");
+			}
 		}
 		l--;
 	}
@@ -15003,6 +15356,7 @@ printf("paramz 1\n");
 		ae->edskoverwrite=param->edskoverwrite;
 		ae->rough=param->rough;
 		ae->as80=param->as80;
+		ae->pasmo=param->pasmo;
 		ae->dams=param->dams;
 		ae->macrovoid=param->macrovoid;
 		if (param->v2) {
@@ -16175,7 +16529,7 @@ int RasmAssembleInfo(const char *datain, int lenin, unsigned char **dataout, int
 {
 	struct s_assenv *ae=NULL;
 	int ret;
-	
+
 	ae=PreProcessing(NULL,1,datain,lenin,NULL);
 	ret=Assemble(ae,dataout,lenout,debug);
 	return ret;
@@ -16372,6 +16726,9 @@ int RasmAssembleInfo(const char *datain, int lenin, unsigned char **dataout, int
 
 #define AUTOTEST_EQUNUM		"mavar = 9:monlabel{mavar+5}truc:unalias{mavar+5}heu equ 50:autrelabel{unalias14heu}:ld hl,autrelabel50"
 
+#define AUTOTEST_EQUDOLLAR	" ld hl,une_equ: ld de,deux_equ: ldir: une_equ equ $+2: deux_equ equ $+4: defw 1: preums: defw 2: deuze: defw 3,4,5,6: assert une_equ == preums: assert deux_equ == deuze"
+
+
 #define AUTOTEST_DELAYNUM	"macro test  label:    dw {label}:    endm:    repeat 3, idx:idx2 = idx-1:" \
 				" test label_{idx2}:    rend:repeat 3, idx:label_{idx-1}:nop:rend"
 
@@ -16414,6 +16771,15 @@ int RasmAssembleInfo(const char *datain, int lenin, unsigned char **dataout, int
 
 #define AUTOTEST_LZSEGMENT	"org #100:debut:jr nz,zend:lz48:repeat 128:nop:rend:lzclose:jp zend:lz48:repeat 2:dec a:jr nz,@next:ld a,5:@next:jp debut:rend:" \
 							"lzclose:zend"
+
+#define AUTOTEST_MULTILZ	"bank: jr suivant: lz48: defs 100,#FF: lzclose: suivant jr lafin: lz49: defs 100,#FF: lzclose: lafin: bank: jr preums: " \
+				" preums jr suivant2: lzapu: defs 100,#FF: lzclose: suivant2 jr lafin2: lzexo: defs 100,#FF: lzclose: lafin2 "
+
+#define AUTOTEST_MULTILZORG " tabeul: defw script0: defw script1: defw script2: " \
+				"script0: org #4000,$: lz48: start1: jr end1: defs 100: djnz start1: end1: lzclose: " \
+				"org $: script1: org #4000,$: lz49: start2: jr end2: defs 100: djnz start2: end2: lzclose: " \
+				"org $: script2: org #4000,$: lz49: start3: jr end3: defs 100: djnz start3: end3: lzclose: " \
+				"org $: ei: ret "
 
 #define AUTOTEST_LZDEFERED	"lz48:defs 20:lzclose:defb $"
 
@@ -16515,6 +16881,8 @@ int RasmAssembleInfo(const char *datain, int lenin, unsigned char **dataout, int
 #define AUTOTEST_LZ4	"lz4:repeat 10:nop:rend:defb 'roudoudoudouoneatxkjhgfdskljhsdfglkhnopnopnopnop':lzclose"
 
 #define AUTOTEST_MAXERROR	"repeat 20:aglapi:rend:nop"
+
+//#define AUTOTEST_REAL	"defr 0,0.5,-0.5 : float 0,0.5,-0.5"
 
 #define AUTOTEST_ENHANCED_LD	"ld h,(ix+11): ld l,(ix+10): ld h,(iy+21): ld l,(iy+20): ld b,(ix+11): ld c,(ix+10):" \
 			"ld b,(iy+21): ld c,(iy+20): ld d,(ix+11): ld e,(ix+10): ld d,(iy+21): ld e,(iy+20): ld hl,(ix+10): " \
@@ -16618,7 +16986,7 @@ struct s_autotest_keyword autotest_keyword[]={
 	{"sbc hl,ix",1},{"sbc hl,iy",1},{"sbc ix,iy",1},{"sbc iy,ix",1},{"sbc hl,0",1},{"sbc hl,grouik",1},{"sbc ix,hl",1},{"sbc iy,hl",1},
 	{"exx",0},{"exx hl",1},{"exx hl,de",1},{"exx af,af'",1},{"exx exx",1},{"exx 5",1},
 	{"ex",1},{"ex af,af'",0},{"ex hl,de",0},{"ex hl,bc",1},{"ex hl,hl",1},{"ex hl,ix",1},
-	{"cp",1},{"cp cp ",1},{"cp 5",0},{"cp c",0},{"cp a,5",0},{"cp a,c",0},{"cp hl",1},{"cp (hl)",0},{"cp a,(hl)",0},{"cp (de)",1},{"cp de",1},
+	{"cp",1},{"cp cp ",1},{"cp $",0},{"cp '$'",0},{"cp 'c'",0},{"cp 5",0},{"cp c",0},{"cp a,5",0},{"cp a,c",0},{"cp hl",1},{"cp (hl)",0},{"cp a,(hl)",0},{"cp (de)",1},{"cp de",1},
 	{"cpi",0},{"cpi (hl)",1},{"cpi a",1},{"cpi 5",1},
 	{"cpd",0},{"cpd (hl)",1},{"cpd a",1},{"cpd 5",1},
 	{"cpir",0},{"cpir (hl)",1},{"cpir a",1},{"cpir 5",1},
@@ -16800,7 +17168,7 @@ printf("testing modulo operator conversion OK\n");
 	ret=RasmAssemble(AUTOTEST_NOINCLUDE,strlen(AUTOTEST_NOINCLUDE),&opcode,&opcodelen);
 	if (!ret) {} else {printf("Autotest %03d ERROR (include missing file)\n",cpt);exit(-1);}
 	if (opcode) MemFree(opcode);opcode=NULL;cpt++;
-printf("include on a missing file OK\n");
+printf("testing include on a missing file OK\n");
 	
 	ret=RasmAssemble(AUTOTEST_FORMAT,strlen(AUTOTEST_FORMAT),&opcode,&opcodelen);
 	if (!ret) {} else {printf("Autotest %03d ERROR (digit formats)\n",cpt);exit(-1);}
@@ -16900,7 +17268,22 @@ printf("testing delayed RUN OK\n");
 	if (!ret && opcodelen==23 && opcode[1]==21 && opcode[9]==23) {} else {printf("Autotest %03d ERROR (LZ segment relocation)\n",cpt);exit(-1);}
 	if (opcode) MemFree(opcode);opcode=NULL;cpt++;
 printf("testing LZ segment relocation OK\n");
-	
+
+#ifndef NOAPULTRA
+	ret=RasmAssemble(AUTOTEST_MULTILZ,strlen(AUTOTEST_MULTILZ),&opcode,&opcodelen);
+	if (!ret && opcodelen==43 && opcode[3]==6 && opcode[11]==0x1F) {} else {printf("Autotest %03d ERROR (multi-LZ segment relocation with multiple BANK)\n",cpt);exit(-1);}
+	if (opcode) MemFree(opcode);opcode=NULL;cpt++;
+printf("testing multi-LZ segment relocation with multiple banks OK\n");
+#else
+printf("*** multi-LZ segment test disabled as there is no APUltra support for MSDOS ***\n");
+#endif
+	ret=RasmAssemble(AUTOTEST_MULTILZORG,strlen(AUTOTEST_MULTILZORG),&opcode,&opcodelen);
+	if (!ret && opcodelen==38 && opcode[0]==6 && opcode[2]==0x10
+			&& opcode[4]==0x1A && opcode[0x23]==0xFF && opcode[0x24]==0xFB) {} else {printf("Autotest %03d ERROR (LZ segments mixed with ORG)\n",cpt);exit(-1);}
+	if (opcode) MemFree(opcode);opcode=NULL;cpt++;
+printf("testing LZ segment + ORG relocation OK\n");
+
+
 	ret=RasmAssemble(AUTOTEST_LZDEFERED,strlen(AUTOTEST_LZDEFERED),&opcode,&opcodelen);
 	if (!ret && opcodelen==7 && opcode[6]==6) {} else {printf("Autotest %03d ERROR (LZ segment + defered $)\n",cpt);exit(-1);}
 	if (opcode) MemFree(opcode);opcode=NULL;cpt++;
@@ -17075,6 +17458,11 @@ printf("testing variables in labels OK\n");
 	if (!ret && opcodelen==3) {} else {printf("Autotest %03d ERROR (variables in aliases) r=%d l=%d\n",cpt,ret,opcodelen);MiniDump(opcode,opcodelen);exit(-1);}
 	if (opcode) MemFree(opcode);opcode=NULL;cpt++;
 printf("testing variables in aliases OK\n");
+
+	ret=RasmAssemble(AUTOTEST_EQUDOLLAR,strlen(AUTOTEST_EQUDOLLAR),&opcode,&opcodelen);
+	if (!ret) {} else {printf("Autotest %03d ERROR (delayed EQU + $) r=%d l=%d\n",cpt,ret,opcodelen);MiniDump(opcode,opcodelen);exit(-1);}
+	if (opcode) MemFree(opcode);opcode=NULL;cpt++;
+printf("testing delayed EQU + $ OK\n");
 
 	ret=RasmAssemble(AUTOTEST_DELAYNUM,strlen(AUTOTEST_DELAYNUM),&opcode,&opcodelen);
 	if (!ret && opcodelen==9 && opcode[0]==6 && opcode[2]==7 && opcode[4]==8) {} else {printf("Autotest %03d ERROR (delayed expr labels) r=%d l=%d\n",cpt,ret,opcodelen);MiniDump(opcode,opcodelen);exit(-1);}
@@ -17269,8 +17657,8 @@ printf("testing page tag with generated label name OK\n");
 		for (i=0;i<debug->nbsymbol;i++) {
 			printf("%d -> %s=%d\n",i,debug->symbol[i].name,debug->symbol[i].v);
 		}
-		RasmFreeInfoStruct(debug);
 */
+		RasmFreeInfoStruct(debug);
 	} else {printf("Autotest %03d ERROR (embedded error struct) err=%d nberr=%d (2) nbsymb=%d (3)\n",cpt,ret,debug->nberror,debug->nbsymbol);MiniDump(opcode,opcodelen);exit(-1);}
 	if (opcode) MemFree(opcode);opcode=NULL;cpt++;
 printf("testing internal error struct OK\n");
@@ -17549,7 +17937,7 @@ void Usage(int help)
 	#undef FUNC
 	#define FUNC "Usage"
 	
-	printf("%s (c) 2017 Edouard BERGE (use -n option to display all licenses)\n",RASM_VERSION);
+	printf("%s (c) 2017 Edouard BERGE (use -n option to display all licenses / -autotest for self-testing)\n",RASM_VERSION);
 	#ifndef NO_3RD_PARTIES
 	printf("LZ4 (c) Yann Collet / ZX7 (c) Einar Saukas / Exomizer 2 (c) Magnus Lind / AP-Ultra (c) Emmanuel Marty\n");
 	#endif
@@ -17591,10 +17979,11 @@ void Usage(int help)
 		printf("-sa export all symbols (like -sl -sv -sq option)\n");
 		printf("-Dvariable=value import value for variable\n");
 		printf("COMPATIBILITY:\n");
-		printf("-m    Maxam style calculations\n");
-		printf("-dams Dams 'dot' label convention\n");
-		printf("-ass  AS80 behaviour mimic\n");
-		printf("-uz   UZ80 behaviour mimic\n");
+		printf("-m     Maxam style calculations\n");
+		printf("-dams  Dams 'dot' label convention\n");
+		printf("-ass   AS80  behaviour mimic\n");
+		printf("-uz    UZ80  behaviour mimic\n");
+		printf("-pasmo PASMO behaviour mimic\n");
 		
 		printf("EDSK generation/update:\n");
 		printf("-eo overwrite files on disk if it already exists\n");
@@ -17829,6 +18218,8 @@ int ParseOptions(char **argv,int argc, struct s_parameter *param)
 		param->as80=2;
 	} else if (strcmp(argv[i],"-twe")==0) {
 		param->erronwarn=1;
+	} else if (strcmp(argv[i],"-pasmo")==0) {
+		param->pasmo=1;
 	} else if (strcmp(argv[i],"-ass")==0) {
 		param->as80=1;
 	} else if (strcmp(argv[i],"-eb")==0) {
