@@ -1,6 +1,6 @@
 # Important
 
-This an official and **obsoleted** repository, since the author now has its own one: https://github.com/EdouardBERGE/rasm
+This an **unofficial** and **obsoleted** repository, since the author now has its own one now: https://github.com/EdouardBERGE/rasm
 
 # Rasm (roudoudou assembler) Z80 assembler
 
