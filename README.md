@@ -1,3 +1,7 @@
+# Important
+
+This an official and **obsoleted** repository, since the author now has its own one: https://github.com/EdouardBERGE/rasm
+
 # Rasm (roudoudou assembler) Z80 assembler
 
 doc & latest official release at: http://www.cpcwiki.eu/forum/programming/rasm-z80-assembler-in-beta/
@@ -6,7 +10,7 @@ You may send requests/bugs in the same topic
 
 ## This software is using MIT "expat" license
 
-« Copyright © BERGE Edouard (roudoudou)
+Â« Copyright Â© BERGE Edouard (roudoudou)
 
 Permission  is  hereby  granted,  free  of charge,to any person obtaining a copy  of  this  software
 and  associated  documentation/source   files   of RASM, to deal in the Software without restriction,
@@ -21,7 +25,7 @@ including  but  not  limited  to the warranties of merchantability,   fitness   
 purpose  and  noninfringement.  In  no event shall the  authors  or  copyright  holders be liable for
 any  claim, damages  or other  liability,  whether in  an  action  of  contract, tort  or  otherwise,
 arising from,  out of  or in connection  with  the software  or  the  use  or  other  dealings in the
-Software. »
+Software. Â»
 
 ## Compilation - without Makefile
 
